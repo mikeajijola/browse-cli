@@ -3,7 +3,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { parseArgs } from "node:util";
 import { paths, mkdir, atomic, workflow, TERMINAL } from "./util.mjs";
-import { setup, auth } from "./provider.mjs";
+import { setup, auth, providerModels } from "./provider.mjs";
 import { loginChatGPT, chatGPTModels, chatGPTAccounts } from "./chatgpt.mjs";
 import { ensureWorker, request, serve } from "./worker.mjs";
 import { Store } from "./store.mjs";
@@ -161,14 +161,33 @@ async function login(p, options) {
 }
 
 async function ensureAuth(p, options) {
+  let credential;
   try {
-    await auth(p, options.model);
+    credential = await auth(p, options.model);
   } catch (e) {
     if (!process.stdin.isTTY) throw e;
     process.stderr.write(`${e.message}\n`);
     const configured = options.provider === "chatgpt"
       ? await login(p, options) : await setup(p, options);
     options.model = configured.model;
+    return;
+  }
+  if (credential.chatgpt) return;
+  let models;
+  try { models = await providerModels(credential.provider, credential.apiKey); }
+  catch (e) {
+    if (e.code !== "INVALID_API_KEY" || !process.stdin.isTTY) throw e;
+    process.stderr.write(`${e.message}\n`);
+    options.model = (await setup(p, { ...options, provider: credential.provider })).model;
+    return;
+  }
+  if (!models.some((m) => `${credential.provider}/${m.id}` === credential.model)) {
+    const message = `Saved model ${credential.model} is unavailable. Choose a model from your provider's current list.`;
+    if (!process.stdin.isTTY) throw Error(message);
+    process.stderr.write(`${message}\n`);
+    options.model = (await setup(p, {
+      provider: credential.provider, apiKey: credential.apiKey, models,
+    })).model;
   }
 }
 

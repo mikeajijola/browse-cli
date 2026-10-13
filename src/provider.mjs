@@ -19,6 +19,55 @@ const providers = {
     env: ["ANTHROPIC_API_KEY"],
   },
 };
+
+export async function providerModels(provider, apiKey, network = globalThis.fetch) {
+  if (!Object.hasOwn(providers, provider)) throw Error("Unsupported provider");
+  if (!apiKey || /[\s\x00-\x1f]/.test(apiKey)) throw Error("Invalid or missing API key");
+  const url = new URL(provider === "google"
+    ? `${providers[provider].origin}/v1beta/models`
+    : `${providers[provider].origin}/v1/models`);
+  const headers = provider === "google" ? { "x-goog-api-key": apiKey }
+    : provider === "anthropic" ? { "x-api-key": apiKey, "anthropic-version": "2023-06-01" }
+    : { Authorization: `Bearer ${apiKey}` };
+  const models = new Map(), cursors = new Set();
+  const signal = AbortSignal.timeout(20000);
+  for (;;) {
+    let response;
+    try { response = await network(url.toString(), { headers, redirect: "error", signal }); }
+    catch { throw Error(`Could not load ${provider} models. Check your connection and try again.`); }
+    if (!response.ok) {
+      await response.body?.cancel();
+      const error = Error(`Could not load ${provider} models (${response.status}). ${[400, 401, 403].includes(response.status) ? "Check your API key and account access." : "Try again later."}`);
+      if ([400, 401, 403].includes(response.status)) error.code = "INVALID_API_KEY";
+      throw error;
+    }
+    const catalog = await response.json();
+    const entries = provider === "google" ? catalog.models : catalog.data;
+    if (!Array.isArray(entries)) throw Error(`${provider} returned an invalid model list.`);
+    for (const entry of entries) {
+      const id = provider === "google" ? entry.name?.replace(/^models\//, "") : entry.id;
+      if (!id || !/^[\w.-]+$/.test(id)) continue;
+      if (provider === "google" && (!entry.supportedGenerationMethods?.includes("generateContent") ||
+          !id.startsWith("gemini-") || /image|tts|audio|live|robotics/i.test(id))) continue;
+      if (provider === "openai" && (!/^(gpt-|o[1-9])/.test(id) ||
+          /instruct|audio|realtime|transcribe|tts|image|search/i.test(id))) continue;
+      if (provider === "anthropic" && entry.capabilities?.image_input?.supported === false) continue;
+      models.set(id, { id, name: entry.displayName || entry.display_name || id });
+    }
+    const cursor = provider === "google" ? catalog.nextPageToken
+      : provider === "anthropic" && catalog.has_more ? catalog.last_id : undefined;
+    if (!cursor) {
+      if (provider === "anthropic" && catalog.has_more) throw Error("Anthropic returned incomplete model pagination.");
+      break;
+    }
+    if (cursors.has(cursor)) throw Error(`${provider} returned repeated model pagination.`);
+    cursors.add(cursor);
+    url.searchParams.set(provider === "google" ? "pageToken" : "after_id", cursor);
+  }
+  if (!models.size) throw Error(`No browser-chat models are available for this ${provider} API key.`);
+  return [...models.values()];
+}
+
 export async function auth(p, model) {
   const saved = json(p.auth, {});
   model ||= saved.model;
@@ -38,14 +87,19 @@ export async function auth(p, model) {
 export async function setup(p, options = {}) {
   let provider = options.provider?.trim().toLowerCase(),
     model = options.model,
-    apiKey;
+    apiKey = options.apiKey;
+  const saved = json(p.auth, {});
+  const savedKey = () => providers[provider].env.map((k) => process.env[k]).find(Boolean) || saved.credentials?.[provider];
   const unsupported = "Unsupported provider. Choose google, openai, or anthropic.";
   if (provider && !Object.hasOwn(providers, provider)) throw Error(unsupported);
   if (!process.stdin.isTTY) {
     if (!provider || !model)
       throw Error("Noninteractive setup requires --provider and --model");
-    apiKey = providers[provider]?.env.map((k) => process.env[k]).find(Boolean);
+    apiKey ||= savedKey();
     if (!apiKey) throw Error("Set the provider API key environment variable");
+    const models = await providerModels(provider, apiKey, options.fetch);
+    const id = model.replace(new RegExp(`^${provider}/`), "");
+    if (!models.some((m) => m.id === id)) throw Error(`Model ${model} is not available for ${provider}. Run browse to choose from the available models.`);
   } else {
     let hidden = false;
     const echo = new Writable({
@@ -95,13 +149,22 @@ export async function setup(p, options = {}) {
         else if (answer === "claude") provider = "anthropic";
         else process.stdout.write(`${unsupported}\n`);
       }
-      apiKey = await ask(
-        `${provider} API key (hidden, Enter uses environment/saved key): `,
-        true,
+      if (!apiKey) apiKey = await ask(
+        `${provider} API key (hidden, Enter uses environment/saved key): `, true,
       );
-      model ||= await ask(
-        "Model ID (no default; choose a vision/tool-capable model): ",
-      );
+      apiKey ||= savedKey();
+      process.stdout.write("Loading available models…\n");
+      const models = options.models || await providerModels(provider, apiKey, options.fetch);
+      process.stdout.write("Choose a model for browser chat:\n");
+      models.forEach((m, i) => process.stdout.write(`  ${i + 1}. ${m.name} (${m.id})\n`));
+      let selected = model && models.find((m) => m.id === model.replace(new RegExp(`^${provider}/`), ""));
+      while (!selected) {
+        const answer = await ask("Model number or ID: ");
+        selected = models.find((m) => m.id === answer || `${provider}/${m.id}` === answer) ||
+          (/^\d+$/.test(answer) ? models[Number(answer) - 1] : undefined);
+        if (!selected) process.stdout.write("Choose a model from the list above. Browser tasks go at browse › after setup.\n");
+      }
+      model = selected.id;
     } finally {
       rl.close();
     }
@@ -110,7 +173,6 @@ export async function setup(p, options = {}) {
   if (!model.includes("/")) model = `${provider}/${model}`;
   if (!model.startsWith(provider + "/") || !/^\w+\/[\w.-]+$/.test(model))
     throw Error("Provider/model mismatch");
-  const saved = json(p.auth, {});
   apiKey ||=
     providers[provider].env.map((k) => process.env[k]).find(Boolean) ||
     saved.credentials?.[provider];

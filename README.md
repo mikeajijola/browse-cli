@@ -18,7 +18,8 @@ browse "Find and download my latest invoice"
 
 On first launch, Browse offers Google/Gemini, OpenAI, and Anthropic/Claude.
 Choose a provider by number or name, enter its API key with hidden input, then
-enter a vision and tool-capable model ID. Browser tasks go at the `browse ›`
+pick a model from the provider's live list. Browse checks your key and model before
+opening chat, and offers a replacement if a saved model is unavailable. Browser tasks go at the `browse ›`
 prompt after setup. Run `browse setup` at any time to change providers.
 
 Optional ChatGPT browser sign-in is available through `browse login`. It opens
