@@ -172,7 +172,10 @@ async function ensureAuth(p, options) {
     options.model = configured.model;
     return;
   }
-  if (credential.chatgpt) return;
+  if (credential.chatgpt) {
+    options.model = credential.model;
+    return;
+  }
   let models;
   try { models = await providerModels(credential.provider, credential.apiKey); }
   catch (e) {
@@ -191,18 +194,31 @@ async function ensureAuth(p, options) {
   } else options.model = credential.model;
 }
 
+export function conversationPreview(opened, model) {
+  const visible = opened.messages.filter((m) => m.role !== "system" &&
+    !/^(?:HTTP \d{3}: )?Provider request failed\b/.test(m.content));
+  const messages = visible.filter((m, i) => !i ||
+    m.role !== visible[i - 1].role || m.content !== visible[i - 1].content);
+  const lines = [];
+  if (messages.length) {
+    lines.push("Continuing your conversation (saved messages):");
+    for (const message of messages.slice(-6))
+      lines.push(`${message.role === "user" ? "You" : "Browse"}: ${message.content.slice(-2000)}`);
+  }
+  if (opened.run?.state === "failed") lines.push("The previous attempt failed; its details are saved in history.");
+  if (opened.run?.question && !messages.some((m) => m.content === opened.run.question))
+    lines.push(opened.run.question);
+  lines.push(`Using ${model}. Ready for your next message.`);
+  return lines.join("\n") + "\n";
+}
+
 async function chat(p, options, initial) {
   await ensureAuth(p, options);
   await ensureWorker(p);
   const opened = await request(p, "conversation_open");
   if (!initial) initial = opened.run;
-  if (!options.json && opened.messages.length) {
-    process.stdout.write("Continuing your conversation:\n");
-    for (const message of opened.messages.slice(-6))
-      process.stdout.write(`${message.role === "user" ? "You" : message.role === "assistant" ? "Browse" : "Notice"}: ${message.content.slice(-2000)}\n`);
-    if (initial?.question && !opened.messages.some((m) => m.content === initial.question))
-      process.stdout.write(`${initial.question}\n`);
-  }
+  if (!options.json && !options.quiet)
+    process.stdout.write(conversationPreview(opened, options.model));
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -275,7 +291,7 @@ async function chat(p, options, initial) {
     if (line === "/reconnect") {
       console.log("Start BrowserOS Neo, then resume the failed or paused run.");
       if (current && !active)
-        current = await request(p, "resume", { id: current.id });
+        current = await request(p, "resume", { id: current.id, model: options.model });
       if (current && !active) {
         active = true;
         try {

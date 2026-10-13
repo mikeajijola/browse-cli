@@ -7,8 +7,27 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { paths } from "../src/util.mjs";
 import { request } from "../src/worker.mjs";
+import { conversationPreview } from "../src/cli.mjs";
 const exec = promisify(execFile),
   bin = new URL("../bin/browse.mjs", import.meta.url).pathname;
+
+test("startup preview identifies saved failures without repeating them as new responses", () => {
+  const attempt = [
+    { role: "user", content: "Find architecture contracts" },
+    { role: "assistant", content: "HTTP 502: Provider request failed (404); check credentials and model." },
+    { role: "system", content: "Provider request failed (404): models/hi is not found" },
+  ];
+  const opened = { run: { state: "failed" }, messages: [...attempt, ...attempt] };
+  const before = JSON.stringify(opened);
+  const preview = conversationPreview(opened, "google/gemini-test-chat");
+  assert.match(preview, /saved messages/);
+  assert.equal((preview.match(/Find architecture contracts/g) || []).length, 1);
+  assert.ok(!preview.includes("models/hi"));
+  assert.ok(!preview.includes("HTTP 502"));
+  assert.match(preview, /previous attempt failed/);
+  assert.match(preview, /Using google\/gemini-test-chat/);
+  assert.equal(JSON.stringify(opened), before);
+});
 
 test("setup explains invalid model providers before requesting credentials", async () => {
   for (const provider of ["Go to totaljobs and find enterprise architecture jobs", "toString"]) {

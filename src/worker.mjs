@@ -18,6 +18,8 @@ import { Store } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
 import { executeAgent, compileWorkflow } from "./agent.mjs";
 
+const WORKER_PROTOCOL = 2;
+
 export function request(p, method, params = {}, timeout = 90000) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(p.socket);
@@ -59,7 +61,7 @@ export async function ensureWorker(p) {
   try {
     status = await request(p, "status", {}, 1000);
   } catch {}
-  if (status?.conversationProtocol === 1) return status;
+  if (status?.conversationProtocol === WORKER_PROTOCOL) return status;
   if (status) {
     if (status.activeRun)
       throw Error("The existing Browse worker needs an update. Let its current turn finish, then reopen browse.");
@@ -131,7 +133,7 @@ export class Worker {
   status() {
     return {
       running: true,
-      conversationProtocol: 1,
+      conversationProtocol: WORKER_PROTOCOL,
       pid: process.pid,
       workspace: this.store.meta("workspace"),
       home: this.p.root,
@@ -191,7 +193,7 @@ export class Worker {
         if (!run || run.historical) {
           return this.store.createRun(args.task, { ...args, conversationId: conversation.id });
         }
-        if (run.question) return this.dispatch("respond", { id: run.id, answer: args.task });
+        if (run.question) return this.dispatch("respond", { ...args, id: run.id, answer: args.task });
         if (TERMINAL.has(run.state) || run.state === "paused")
           return this.dispatch("continue", { ...args, id: run.id });
         await this.dispatch("steer", { id: run.id, text: args.task });
@@ -240,6 +242,7 @@ export class Worker {
           run.recoveryNeeded;
         run.state = "queued";
         delete run.wakeAt;
+        if (args.model) run.model = args.model;
         this.store.saveRun(run);
         return run;
       }
@@ -254,6 +257,7 @@ export class Worker {
         });
         delete run.question;
         run.state = "queued";
+        if (args.model) run.model = args.model;
         // User answers authorize another read-only recovery pass; they never silently mark a browser action successful.
         this.store.saveRun(run);
         this.store.event(run.id, "response", { answer: args.answer });

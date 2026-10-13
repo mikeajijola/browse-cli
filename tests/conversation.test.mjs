@@ -41,6 +41,21 @@ test("reopening Browse continues the same conversation and preserves both user a
   assert.match(f.worker.store.conversationSearch(first.conversationId, "contract rate")[0].content, /contract rate/);
 });
 
+test("continuing a previously failed conversation uses the newly selected model", async (t) => {
+  let actualModel;
+  const f = fixture(t, async (options) => { actualModel = options.run.model; return success(options); });
+  const run = await f.worker.dispatch("conversation_submit", { task: "Search", model: "google/hi" });
+  const failed = f.worker.store.run(run.id);
+  failed.state = "failed";
+  failed.error = "Old model unavailable";
+  f.worker.store.saveRun(failed);
+  await f.restart().dispatch("conversation_open");
+  await f.worker.dispatch("conversation_submit", { task: "Try again", model: "google/gemini-test-chat" });
+  await f.worker.tick();
+  assert.equal(actualModel, "google/gemini-test-chat");
+  assert.equal(f.worker.store.run(run.id).error, undefined);
+});
+
 test("legacy manual runs migrate into the ongoing transcript while workflows stay separate", async (t) => {
   const f = fixture(t);
   const first = await f.worker.dispatch("submit", { task: "Older chat" });
@@ -115,12 +130,13 @@ test("reopened conversation accepts a pending answer instead of creating a separ
   const f = fixture(t, async (options) => ++calls === 1
     ? { answer: "Which account?", control: { type: "input", question: "Which account?" } }
     : success(options));
-  const run = await f.worker.dispatch("conversation_submit", { task: "Find invoices" });
+  const run = await f.worker.dispatch("conversation_submit", { task: "Find invoices", model: "google/old-model" });
   await f.worker.tick();
   const opened = await f.restart().dispatch("conversation_open");
   assert.equal(opened.run.question, "Which account?");
-  const answered = await f.worker.dispatch("conversation_submit", { task: "Personal" });
+  const answered = await f.worker.dispatch("conversation_submit", { task: "Personal", model: "google/new-model" });
   assert.equal(answered.id, run.id);
+  assert.equal(answered.model, "google/new-model");
   await f.worker.tick();
   assert.equal(f.worker.store.run(run.id).inputs[0].answer, "Personal");
   assert.ok(f.worker.store.conversationMessages(run.conversationId).some((m) => m.content === "Personal"));
