@@ -83,6 +83,9 @@ task; `/new` explicitly starts a separate conversation and retains the old histo
 Closing and reopening `browse` keeps the same conversation, shows recent messages,
 and reconnects to an active turn or pending question. `/help`, `/status`, `/reconnect`, and
 `/exit` are also available. Answer a pending question by typing a message.
+Use Up/Down Arrow to recall and edit your previous messages, including after
+restarting Browse. Recall is scoped to the current conversation; `/new` starts
+with an empty input history.
 
 Closing the terminal detaches work. Ctrl+C during attached execution cancels the
 active task. Cancellation does not undo browser actions. Browser tabs are retained.

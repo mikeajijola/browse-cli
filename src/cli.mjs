@@ -8,6 +8,7 @@ import { loginChatGPT, chatGPTModels, chatGPTAccounts } from "./chatgpt.mjs";
 import { ensureWorker, request, serve } from "./worker.mjs";
 import { Store } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
+import { createChatInput } from "./terminal.mjs";
 
 const HELP = `browse — durable browser execution with libfx, Neo, and Fossil
 
@@ -219,12 +220,7 @@ async function chat(p, options, initial) {
   if (!initial) initial = opened.run;
   if (!options.json && !options.quiet)
     process.stdout.write(conversationPreview(opened, options.model));
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: "browse › ",
-    terminal: Boolean(process.stdin.isTTY),
-  });
+  const rl = createChatInput({ history: opened.inputHistory || [] });
   let current = initial,
     active = false,
     closed = false,
@@ -285,6 +281,7 @@ async function chat(p, options, initial) {
       if (active) throw Error("Stop the current turn first");
       await request(p, "conversation_new");
       current = null;
+      rl.history = [];
       if (!options.json) console.log("Started a new conversation. Your previous history is retained.");
       return;
     }

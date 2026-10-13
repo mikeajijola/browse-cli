@@ -18,7 +18,7 @@ import { Store } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
 import { executeAgent, compileWorkflow } from "./agent.mjs";
 
-const WORKER_PROTOCOL = 2;
+const WORKER_PROTOCOL = 3;
 
 export function request(p, method, params = {}, timeout = 90000) {
   return new Promise((resolve, reject) => {
@@ -181,6 +181,7 @@ export class Worker {
         }
         const run = conversation?.run_id ? this.store.run(conversation.run_id) : null;
         return { conversation, run, after: run ? this.store.eventCursor(run.id) : 0,
+          inputHistory: this.store.conversationInputHistory(conversation?.id),
           messages: conversation ? this.store.conversationMessages(conversation.id, 10) : [] };
       }
       case "conversation_new":

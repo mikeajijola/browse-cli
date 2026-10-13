@@ -29,6 +29,7 @@ test("reopening Browse continues the same conversation and preserves both user a
   await f.worker.tick();
   const opened = await f.restart().dispatch("conversation_open");
   assert.equal(opened.run.id, first.id);
+  assert.deepEqual(opened.inputHistory, ["Remember my contract rate"]);
   assert.deepEqual(opened.messages.map((m) => [m.role, m.content]), [
     ["user", "Remember my contract rate"], ["assistant", "Answer to Remember my contract rate"],
   ]);
@@ -37,6 +38,8 @@ test("reopening Browse continues the same conversation and preserves both user a
   assert.equal(second.conversationId, first.conversationId);
   await f.worker.tick();
   assert.equal(f.worker.store.conversationMessages(first.conversationId).length, 4);
+  assert.deepEqual((await f.worker.dispatch("conversation_open")).inputHistory,
+    ["Use that rate for this search", "Remember my contract rate"]);
   assert.deepEqual(f.worker.store.events(first.id, opened.after).filter((e) => e.type === "text_delta").map((e) => e.delta), ["Answer to Use that rate for this search"]);
   assert.match(f.worker.store.conversationSearch(first.conversationId, "contract rate")[0].content, /contract rate/);
 });
@@ -118,6 +121,7 @@ test("explicit new conversation retains the previous transcript and does not reu
   await f.worker.tick();
   await f.worker.dispatch("conversation_new");
   assert.equal((await f.restart().dispatch("conversation_open")).run, null);
+  assert.deepEqual((await f.worker.dispatch("conversation_open")).inputHistory, []);
   const next = await f.worker.dispatch("conversation_submit", { task: "New discussion" });
   await f.worker.tick();
   assert.notEqual(next.id, old.id);

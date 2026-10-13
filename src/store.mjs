@@ -130,6 +130,12 @@ export class Store {
     return this.db.prepare("SELECT * FROM messages WHERE conversation_id=? ORDER BY ordinal DESC,created_at DESC LIMIT ?")
       .all(conversationId, Math.max(1, Math.min(500, limit))).reverse();
   }
+  conversationInputHistory(conversationId) {
+    if (!conversationId) return [];
+    const messages = this.db.prepare("SELECT content FROM messages WHERE conversation_id=? AND role='user' ORDER BY ordinal DESC LIMIT 500")
+      .all(conversationId);
+    return [...new Set(messages.map((m) => m.content).filter((text) => text.trim() && !text.startsWith("/")))];
+  }
   conversationContext(conversationId, budget = 48000) {
     if (!conversationId) return [];
     const messages = this.conversationMessages(conversationId, 100);
