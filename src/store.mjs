@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { id, now, mkdir, workflow } from "./util.mjs";
+import { importHistory } from "./history.mjs";
 
 export class Store {
   constructor(p) {
@@ -16,6 +17,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id,seq);
+      CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, run_id TEXT);
+      CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, run_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, ordinal INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages(conversation_id,ordinal);
       CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL);
       CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(id UNINDEXED, text);
       CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, path TEXT NOT NULL, data TEXT NOT NULL);
@@ -52,8 +57,14 @@ export class Store {
   }
   acknowledge(ids) {
     this.tx(() => {
-      for (const operation of ids)
+      for (const operation of ids) {
+        const row = this.db.prepare("SELECT path,data FROM outbox WHERE id=?").get(operation);
+        if (row?.path === "history.sqlite") {
+          const snapshot = JSON.parse(row.data);
+          this.setMeta("historyPublished", String(snapshot.revision));
+        }
         this.db.prepare("DELETE FROM outbox WHERE id=?").run(operation);
+      }
     });
   }
   event(runId, type, detail = {}) {
@@ -61,7 +72,84 @@ export class Store {
     const result = this.db
       .prepare("INSERT INTO events(run_id,data) VALUES(?,?)")
       .run(runId, JSON.stringify(data));
-    return { ...data, seq: Number(result.lastInsertRowid) };
+    const seq = Number(result.lastInsertRowid);
+    this.historyEvent(runId, data, seq);
+    return { ...data, seq };
+  }
+  historyChanged() {
+    this.setMeta("historyRevision", String(Number(this.meta("historyRevision") || 0) + 1));
+  }
+  conversation() {
+    const active = this.meta("activeConversation");
+    return active ? this.db.prepare("SELECT * FROM conversations WHERE id=?").get(active) || null : null;
+  }
+  newConversation() {
+    const conversation = { id: id(), created_at: now(), updated_at: now(), run_id: null };
+    this.tx(() => {
+      this.db.prepare("INSERT INTO conversations VALUES(?,?,?,?)")
+        .run(conversation.id, conversation.created_at, conversation.updated_at, null);
+      this.setMeta("activeConversation", conversation.id);
+      this.historyChanged();
+    });
+    return conversation;
+  }
+  linkConversation(conversationId, runId) {
+    this.db.prepare("UPDATE conversations SET run_id=?,updated_at=? WHERE id=?").run(runId, now(), conversationId);
+    this.historyChanged();
+  }
+  historyEvent(runId, event, seq) {
+    const row = this.db.prepare("SELECT data FROM runs WHERE id=?").get(runId);
+    const run = row && JSON.parse(row.data);
+    if (!run?.conversationId) return;
+    if (event.type === "running") this.setMeta(`historyTurn:${runId}`, String(seq));
+    let role, content, messageId;
+    if (["queued", "user_message", "response", "steering"].includes(event.type)) {
+      role = "user";
+      content = event.task ?? event.text ?? event.answer;
+      messageId = `${runId}:user:${seq}`;
+    } else if (event.type === "text_delta" || event.answer || event.question || event.error) {
+      role = event.error ? "system" : "assistant";
+      content = event.delta ?? event.answer ?? event.question ?? event.error;
+      messageId = event.error ? `${runId}:error:${seq}`
+        : `${runId}:assistant:${this.meta(`historyTurn:${runId}`) || seq}`;
+    }
+    if (typeof content !== "string" || !content) return;
+    const order = Number(this.meta("historyOrder") || 0) + 1;
+    this.setMeta("historyOrder", String(order));
+    if (event.type === "text_delta") {
+      this.db.prepare(`INSERT INTO messages VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET content=content || excluded.content`)
+        .run(messageId, run.conversationId, runId, role, content, event.at, order);
+    } else {
+      this.db.prepare("INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)")
+        .run(messageId, run.conversationId, runId, role, content, event.at, order);
+    }
+    this.db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(event.at, run.conversationId);
+    this.historyChanged();
+  }
+  conversationMessages(conversationId, limit = 50) {
+    return this.db.prepare("SELECT * FROM messages WHERE conversation_id=? ORDER BY ordinal DESC,created_at DESC LIMIT ?")
+      .all(conversationId, Math.max(1, Math.min(500, limit))).reverse();
+  }
+  conversationContext(conversationId, budget = 48000) {
+    if (!conversationId) return [];
+    const messages = this.conversationMessages(conversationId, 100);
+    const selected = [];
+    for (const message of messages.reverse()) {
+      if (budget <= 0) break;
+      const content = message.content.slice(-Math.min(budget, 16000));
+      selected.unshift({ role: message.role, content, at: message.created_at });
+      budget -= content.length;
+    }
+    return selected;
+  }
+  conversationSearch(conversationId, query) {
+    if (typeof query !== "string" || !query.trim()) throw Error("History search needs a query");
+    const escaped = query.trim().replace(/[\\%_]/g, "\\$&");
+    return this.db.prepare("SELECT role,content,created_at FROM messages WHERE conversation_id=? AND content LIKE ? ESCAPE '\\' ORDER BY ordinal DESC LIMIT 10")
+      .all(conversationId, `%${escaped}%`).map((m) => {
+        const start = Math.max(0, m.content.toLowerCase().indexOf(query.trim().toLowerCase()) - 2000);
+        return { ...m, content: m.content.slice(start, start + 8000) };
+      });
   }
   events(runId, after = 0) {
     return this.db
@@ -70,6 +158,9 @@ export class Store {
       )
       .all(runId, after)
       .map((r) => ({ ...JSON.parse(r.data), seq: r.seq }));
+  }
+  eventCursor(runId) {
+    return this.db.prepare("SELECT COALESCE(MAX(seq),0) AS seq FROM events WHERE run_id=?").get(runId).seq;
   }
   run(runId) {
     const row = this.db.prepare("SELECT data FROM runs WHERE id=?").get(runId);
@@ -106,10 +197,12 @@ export class Store {
       skillRevisions: [],
       inputs: [],
       attachments: options.attachments || [],
+      conversationId: options.conversationId,
       checkpointSeq: 0,
     };
     this.tx(() => {
       this.saveRun(run);
+      if (run.conversationId) this.linkConversation(run.conversationId, run.id);
       this.event(run.id, "queued", { task });
       this.queue(`runs/${run.id}.json`, run);
     });
@@ -353,6 +446,7 @@ export class Store {
               .run(s.name, JSON.stringify({ ...s, enabled: false }));
         }
       }
+    importHistory(this, checkout);
   }
   saveWorkflow(value) {
     return this.record("workflow", workflow(value), { logicalId: value.name });

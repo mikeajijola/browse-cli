@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { id, now, mkdir, atomic, inside, hash, json } from "./util.mjs";
+import { prepareHistory } from "./history.mjs";
 
 export class Workspace {
   constructor(p, store) {
@@ -70,7 +71,11 @@ export class Workspace {
   }
   flush() {
     let pending = this.store.pending();
-    if (!pending.length) return { committed: 0 };
+    if (!pending.length) {
+      prepareHistory(this.store);
+      pending = this.store.pending();
+      if (!pending.length) return { committed: 0 };
+    }
     // A prior commit may have succeeded immediately before an acknowledgement crash.
     const timeline = this.fossil([
       "timeline",
@@ -88,19 +93,34 @@ export class Workspace {
       .map((row) => row.id);
     if (acknowledged.length) {
       this.store.acknowledge(acknowledged);
+      for (const row of pending)
+        if (acknowledged.includes(row.id) && row.path === "history.sqlite")
+          fs.rmSync(JSON.parse(row.data).file, { force: true });
       pending = pending.filter((row) => !acknowledged.includes(row.id));
     }
+    prepareHistory(this.store);
+    pending = this.store.pending();
     if (!pending.length) return { committed: acknowledged.length };
     const ids = pending.map((r) => r.id),
       marker = `browse-outbox:${ids.join(",")}`;
     if (!timeline.includes(marker)) {
-      for (const row of pending)
-        atomic(inside(this.p.checkout, row.path), row.data + "\n");
+      for (const row of pending) {
+        if (row.path === "history.sqlite") {
+          const snapshot = JSON.parse(row.data);
+          if (snapshot.format !== "browse.history-snapshot/v1" ||
+              path.dirname(snapshot.file) !== path.join(this.p.private, "history-snapshots"))
+            throw Error("Invalid conversation snapshot publication");
+          const bytes = fs.readFileSync(snapshot.file);
+          if (hash(bytes) !== snapshot.hash) throw Error("Altered conversation snapshot");
+          atomic(inside(this.p.checkout, row.path), bytes);
+        } else atomic(inside(this.p.checkout, row.path), row.data + "\n");
+      }
       const changed = [...new Set(pending.map((r) => r.path))];
       this.fossil(["add", ...changed]);
-      if (this.fossil(["changes"]).trim())
+      if (this.fossil(["changes", "--hash"]).trim())
         this.fossil([
           "commit",
+          "--hash",
           "--no-prompt",
           "--no-warnings",
           "--nosign",
@@ -112,10 +132,14 @@ export class Workspace {
         ]);
     }
     this.store.acknowledge(ids);
+    for (const row of pending)
+      if (row.path === "history.sqlite") fs.rmSync(JSON.parse(row.data).file, { force: true });
+    if (Number(this.store.meta("historyRevision") || 0) > Number(this.store.meta("historyPublished") || 0))
+      return { committed: pending.length + this.flush().committed };
     return { committed: pending.length };
   }
   verify() {
-    if (this.fossil(["changes"]).trim())
+    if (this.fossil(["changes", "--hash"]).trim())
       throw Error(
         "Checkout has uncommitted changes; export requires a clean checkout",
       );

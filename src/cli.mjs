@@ -11,8 +11,8 @@ import { Workspace } from "./workspace.mjs";
 
 const HELP = `browse — durable browser execution with libfx, Neo, and Fossil
 
-  browse                                  Interactive browser chat
-  browse "instruction" [--detach]          Execute a durable run
+  browse                                  Continue your ongoing conversation
+  browse "instruction" [--detach]          Add a turn to your ongoing conversation
   browse --resume RUN_ID                   Attach to or resume a run
   browse login                            Sign in with ChatGPT in your browser
   browse login --new-account               Add another ChatGPT account
@@ -43,7 +43,7 @@ Credentials and live execution state never enter the portable Fossil repository.
 `;
 
 export async function monitor(p, runId, options = {}, signal) {
-  let cursor = 0,
+  let cursor = options.after || 0,
     seenQuestion;
   while (!signal?.aborted) {
     const events = await request(p, "events", { id: runId, after: cursor });
@@ -72,14 +72,14 @@ export async function monitor(p, runId, options = {}, signal) {
       if (run.question && seenQuestion !== run.question) {
         if (!options.json)
           process.stderr.write(
-            `${run.question}\nAnswer: browse respond ${run.id} "answer"\n`,
+            `${run.question}\n${options.interactive ? "Reply here to continue." : `Answer: browse respond ${run.id} "answer"`}\n`,
           );
         seenQuestion = run.question;
       }
       if (run.error && !options.json) process.stderr.write(`${run.error}\n`);
       if (options.json)
         console.log(JSON.stringify({ type: "run_result", run }));
-      else if (!options.quiet)
+      else if (!options.quiet && (!options.interactive || options.verbose))
         process.stderr.write(`Run ${run.id}: ${run.state}\n`);
       return run;
     }
@@ -188,12 +188,21 @@ async function ensureAuth(p, options) {
     options.model = (await setup(p, {
       provider: credential.provider, apiKey: credential.apiKey, models,
     })).model;
-  }
+  } else options.model = credential.model;
 }
 
 async function chat(p, options, initial) {
   await ensureAuth(p, options);
   await ensureWorker(p);
+  const opened = await request(p, "conversation_open");
+  if (!initial) initial = opened.run;
+  if (!options.json && opened.messages.length) {
+    process.stdout.write("Continuing your conversation:\n");
+    for (const message of opened.messages.slice(-6))
+      process.stdout.write(`${message.role === "user" ? "You" : message.role === "assistant" ? "Browse" : "Notice"}: ${message.content.slice(-2000)}\n`);
+    if (initial?.question && !opened.messages.some((m) => m.content === initial.question))
+      process.stdout.write(`${initial.question}\n`);
+  }
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -203,30 +212,34 @@ async function chat(p, options, initial) {
   let current = initial,
     active = false,
     closed = false,
-    attachmentController;
+    attachmentController,
+    submission;
   async function execute(task) {
+    if (submission) await submission;
     if (active) {
       await request(p, "steer", { id: current.id, text: task });
       return;
     }
-    const latest = current ? await request(p, "run", { id: current.id }) : null;
-    if (latest?.question)
-      current = await request(p, "respond", { id: current.id, answer: task });
-    else if (latest && TERMINAL.has(latest.state) && !latest.historical)
-      current = await request(p, "continue", { id: current.id, task });
-    else
-      current = await request(p, "submit", {
+    active = true;
+    submission = (async () => {
+      const after = current ? await request(p, "event_cursor", { id: current.id }) : 0;
+      current = await request(p, "conversation_submit", {
         task,
         model: options.model,
         attachments: options.attach,
       });
-    active = true;
-    attachmentController = new AbortController();
+      return after;
+    })();
     try {
+      const after = await submission;
+      submission = null;
+      if (closed) return;
+      attachmentController = new AbortController();
       current =
-        (await monitor(p, current.id, options, attachmentController.signal)) ||
+        (await monitor(p, current.id, { ...options, after, interactive: true }, attachmentController.signal)) ||
         current;
     } finally {
+      submission = null;
       active = false;
       if (!closed) rl.prompt();
     }
@@ -254,7 +267,9 @@ async function chat(p, options, initial) {
     }
     if (line === "/new") {
       if (active) throw Error("Stop the current turn first");
+      await request(p, "conversation_new");
       current = null;
+      if (!options.json) console.log("Started a new conversation. Your previous history is retained.");
       return;
     }
     if (line === "/reconnect") {
@@ -264,7 +279,7 @@ async function chat(p, options, initial) {
       if (current && !active) {
         active = true;
         try {
-          await monitor(p, current.id, options);
+          await monitor(p, current.id, { ...options, interactive: true });
         } finally {
           active = false;
         }
@@ -287,6 +302,14 @@ async function chat(p, options, initial) {
       );
     else rl.close();
   });
+  if (current && ["running", "queued"].includes(current.state) && !current.historical) {
+    active = true;
+    attachmentController = new AbortController();
+    monitor(p, current.id, { ...options, after: opened.after, interactive: true }, attachmentController.signal)
+      .then((run) => { if (run) current = run; })
+      .catch((e) => console.error(e.message))
+      .finally(() => { active = false; if (!closed) rl.prompt(); });
+  }
   rl.prompt();
   await new Promise((resolve) =>
     rl.once("close", () => {
@@ -579,13 +602,14 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
   await ensureAuth(p, o);
+  const opened = await call("conversation_open");
   await attach(
     p,
-    await call("submit", {
+    await call("conversation_submit", {
       task: a.join(" "),
       model: o.model,
       attachments: o.attach,
     }),
-    o,
+    { ...o, after: opened.after },
   );
 }

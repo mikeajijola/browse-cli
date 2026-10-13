@@ -55,9 +55,23 @@ export function request(p, method, params = {}, timeout = 90000) {
   });
 }
 export async function ensureWorker(p) {
+  let status;
   try {
-    return await request(p, "status", {}, 1000);
+    status = await request(p, "status", {}, 1000);
   } catch {}
+  if (status?.conversationProtocol === 1) return status;
+  if (status) {
+    if (status.activeRun)
+      throw Error("The existing Browse worker needs an update. Let its current turn finish, then reopen browse.");
+    await request(p, "stop");
+    let stopped = false;
+    for (let i = 0; i < 100; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try { await request(p, "status", {}, 1000); }
+      catch { stopped = true; break; }
+    }
+    if (!stopped) throw Error("The previous Browse worker did not stop; try again shortly.");
+  }
   mkdir(p.private);
   const output = fs.openSync(path.join(p.private, "worker.log"), "a", 0o600);
   const child = spawn(
@@ -117,12 +131,14 @@ export class Worker {
   status() {
     return {
       running: true,
+      conversationProtocol: 1,
       pid: process.pid,
       workspace: this.store.meta("workspace"),
       home: this.p.root,
       activeRun: this.active?.id,
       publicationError: this.publicationError,
       pendingPublications: this.store.pending().length,
+      conversation: this.store.conversation()?.id,
     };
   }
   async dispatch(method, args = {}) {
@@ -132,6 +148,55 @@ export class Worker {
         return this.status();
       case "submit":
         return this.store.createRun(args.task, args);
+      case "conversation_open": {
+        let conversation = this.store.conversation();
+        if (!conversation && !this.store.meta("activeConversation")) {
+          const previousRuns = this.store.runs().filter((r) => !r.historical && !r.workflowRevision && !r.conversationId).reverse();
+          if (previousRuns.length) {
+            conversation = this.store.newConversation();
+            for (const previous of previousRuns) {
+              previous.conversationId = conversation.id;
+              this.store.saveRun(previous);
+              this.store.linkConversation(conversation.id, previous.id);
+              let after = 0;
+              const seen = new Set([0]);
+              for (;;) {
+                const events = this.store.events(previous.id, after);
+                for (const event of events) {
+                  if (event.type === "running" && !seen.has(event.step) && previous.steps[event.step]?.task) {
+                    this.store.historyEvent(previous.id, { type: "user_message", text: previous.steps[event.step].task, at: event.at }, `${event.seq}:legacy`);
+                    seen.add(event.step);
+                  }
+                  this.store.historyEvent(previous.id, event, event.seq);
+                  after = event.seq;
+                }
+                if (events.length < 1000) break;
+              }
+              this.store.portableRun(previous.id);
+            }
+            conversation = this.store.conversation();
+          }
+        }
+        const run = conversation?.run_id ? this.store.run(conversation.run_id) : null;
+        return { conversation, run, after: run ? this.store.eventCursor(run.id) : 0,
+          messages: conversation ? this.store.conversationMessages(conversation.id, 10) : [] };
+      }
+      case "conversation_new":
+        return this.store.newConversation();
+      case "conversation_submit": {
+        if (typeof args.task !== "string" || !args.task.trim() || args.task.length > 64000)
+          throw Error("Instruction must be nonempty and at most 64000 characters");
+        const conversation = this.store.conversation() || this.store.newConversation();
+        const run = conversation.run_id ? this.store.run(conversation.run_id) : null;
+        if (!run || run.historical) {
+          return this.store.createRun(args.task, { ...args, conversationId: conversation.id });
+        }
+        if (run.question) return this.dispatch("respond", { id: run.id, answer: args.task });
+        if (TERMINAL.has(run.state) || run.state === "paused")
+          return this.dispatch("continue", { ...args, id: run.id });
+        await this.dispatch("steer", { id: run.id, text: args.task });
+        return this.store.run(run.id);
+      }
       case "runs":
         return this.store.runs();
       case "run":
@@ -141,6 +206,8 @@ export class Worker {
         };
       case "events":
         return this.store.events(args.id, args.after || 0);
+      case "event_cursor":
+        return this.store.eventCursor(args.id);
       case "pause":
       case "cancel": {
         const run = this.store.run(args.id);
@@ -194,18 +261,21 @@ export class Worker {
       }
       case "steer": {
         const run = this.store.run(args.id);
+        if (run.historical || !["running", "queued", "waiting"].includes(run.state))
+          throw Error("No active turn; use continue");
         this.store.event(run.id, "steering", { text: args.text });
         run.inputs.push({ steering: args.text, at: now() });
         this.store.saveRun(run);
         if (this.active?.id === run.id && this.turn)
           await this.turn.steer(args.text);
-        else throw Error("No active turn; use continue");
         return { accepted: true };
       }
       case "continue": {
         const run = this.store.run(args.id);
-        if (run.historical || !TERMINAL.has(run.state))
+        if (run.historical || (!TERMINAL.has(run.state) && !(run.conversationId && run.state === "paused")))
           throw Error("Run is not available for continuation");
+        if (typeof args.task !== "string" || !args.task.trim() || args.task.length > 64000)
+          throw Error("Instruction must be nonempty and at most 64000 characters");
         run.recoveryNeeded ||= this.store
           .actions(run.id)
           .some((a) => a.state === "dispatched" && a.effectful);
@@ -214,7 +284,14 @@ export class Worker {
         run.task = args.task;
         run.state = "queued";
         delete run.error;
-        this.store.saveRun(run);
+        if (args.model) run.model = args.model;
+        if (args.attachments?.length)
+          run.attachments = [...new Set([...run.attachments, ...args.attachments])];
+        this.store.tx(() => {
+          this.store.saveRun(run);
+          this.store.event(run.id, "user_message", { text: args.task });
+          this.store.portableRun(run.id);
+        });
         return run;
       }
       case "feedback": {

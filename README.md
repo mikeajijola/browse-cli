@@ -64,8 +64,8 @@ Set `BROWSE_NEO_URL` to override it. Browse never silently switches browsers.
 ## Run browser tasks
 
 ```sh
-browse                                      # Interactive chat
-browse "Search the website and write report.md"
+browse                                      # Reopen your ongoing conversation
+browse "Search the website and write report.md"  # Another turn in the same conversation
 browse "Upload the report to this form" --attach ./report.pdf
 browse "Download my invoices" --detach
 browse --resume RUN_ID
@@ -79,7 +79,9 @@ browse respond RUN_ID "Use my personal account"
 ```
 
 Type while an interactive turn is running to steer it. `/stop` cancels the current
-task; `/new` starts a separate conversation. `/help`, `/status`, `/reconnect`, and
+task; `/new` explicitly starts a separate conversation and retains the old history.
+Closing and reopening `browse` keeps the same conversation, shows recent messages,
+and reconnects to an active turn or pending question. `/help`, `/status`, `/reconnect`, and
 `/exit` are also available. Answer a pending question by typing a message.
 
 Closing the terminal detaches work. Ctrl+C during attached execution cancels the
@@ -87,6 +89,21 @@ active task. Cancellation does not undo browser actions. Browser tabs are retain
 `--quiet` suppresses routine progress; `--verbose` shows event types without raw
 tool arguments. `--json` emits machine-readable output, with JSONL events for
 attached runs. Stored transcripts and tool results may contain personal data.
+
+The full conversation transcript is stored as **`checkout/history.sqlite`**, a
+self-contained SQLite artifact versioned in Fossil. It contains conversations and
+user/assistant messages, including steering, answers to questions, and errors.
+Consistent snapshots are committed at run milestones and while idle; failed
+publication is retried without rerunning browser actions. The live transcript is
+also durable in the runtime database between snapshots.
+
+Private libfx checkpoints keep model context across local restarts. If a checkpoint
+is unavailable or too large, Browse uses a bounded selection of recent messages;
+the agent can search older messages through `conversation_search`. The full
+transcript remains in SQLite even when it exceeds the model's context window.
+Importing a Fossil workspace restores the same conversation history. A new request
+continues that narrative with a fresh execution run; imported browser actions
+remain non-executable history.
 
 Browse acts within your instruction. Missing details, login challenges and
 uncertain outcomes cause it to request input. Local file access is limited to
@@ -153,6 +170,7 @@ historical records. Imported schedules are disabled until explicitly enabled.
 ```text
 checkout/
   workspace.json
+  history.sqlite
   skills/
   workflows/
   memory/
