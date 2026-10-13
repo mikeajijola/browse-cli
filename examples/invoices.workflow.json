@@ -1,0 +1,15 @@
+{
+  "format": "browse.workflow/v1",
+  "name": "invoices",
+  "description": "Download invoices from the account I specify and create a Markdown summary.",
+  "steps": [
+    {
+      "type": "input",
+      "question": "Which website and invoice period should I use?"
+    },
+    {
+      "type": "browser",
+      "task": "Use the supplied website and period. Download the matching invoices, retain them as Fossil artifacts, and write an invoices.md summary with the observed amounts and artifact paths. Request input if login requires human intervention."
+    }
+  ]
+}

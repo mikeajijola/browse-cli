@@ -1,0 +1,32 @@
+{
+  "name": "browse-durable-cli",
+  "version": "0.1.0",
+  "description": "Browse: libfx browser execution with durable local workflows and Fossil memory",
+  "type": "module",
+  "bin": {
+    "browse": "bin/browse.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "test:browser": "node tests/live-browser.mjs",
+    "start": "node bin/browse.mjs"
+  },
+  "dependencies": {
+    "libfx": "0.0.13",
+    "@ai-sdk/google": "4.0.88",
+    "@ai-sdk/openai": "4.0.91",
+    "@ai-sdk/anthropic": "4.0.78",
+    "ajv": "8.20.0"
+  },
+  "license": "Apache-2.0",
+  "files": [
+    "bin",
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ]
+}
