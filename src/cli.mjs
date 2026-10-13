@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { parseArgs } from "node:util";
-import { paths, mkdir, workflow, TERMINAL } from "./util.mjs";
+import { paths, mkdir, atomic, workflow, TERMINAL } from "./util.mjs";
 import { setup, auth } from "./provider.mjs";
+import { loginChatGPT, chatGPTModels, chatGPTAccounts } from "./chatgpt.mjs";
 import { ensureWorker, request, serve } from "./worker.mjs";
 import { Store } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
@@ -13,6 +14,10 @@ const HELP = `browse — durable browser execution with libfx, Neo, and Fossil
   browse                                  Interactive browser chat
   browse "instruction" [--detach]          Execute a durable run
   browse --resume RUN_ID                   Attach to or resume a run
+  browse login                            Sign in with ChatGPT in your browser
+  browse login --new-account               Add another ChatGPT account
+  browse login --list                      List saved ChatGPT accounts
+  browse login --account ID                Reconnect a saved ChatGPT account
   browse setup --provider NAME --model ID  Configure direct provider access
   browse runs list|show|logs|pause|resume|cancel [RUN_ID]
   browse respond RUN_ID "answer"
@@ -117,13 +122,60 @@ function print(value, options) {
   else console.log(value);
 }
 
-async function chat(p, options, initial) {
+async function login(p, options) {
+  process.stderr.write("Continue with ChatGPT — opening the browser. Allow Browse to use your ChatGPT plan.\n");
+  await loginChatGPT(p, {
+    newAccount: options["new-account"],
+    account: options.account,
+    onURL: (url) => process.stderr.write(`If the page does not open, open this URL on the machine running Browse:\n${url}\n`),
+    onBrowserError: () => process.stderr.write("Could not open BrowserOS Neo. Start Neo or open the URL above manually.\n"),
+  });
+  const models = await chatGPTModels(p);
+  let selected;
+  if (options.model) {
+    selected = models.find((m) => m.id === options.model.replace(/^chatgpt\//, ""));
+    if (!selected) throw Error("The requested model is not available to this ChatGPT account.");
+  } else {
+    if (!process.stdin.isTTY) throw Error("Signed in. Run browse login --model MODEL_ID to select an available model.");
+    process.stdout.write("Connected to ChatGPT. Choose a vision/tool-capable model:\n");
+    models.forEach((m, i) => process.stdout.write(`  ${i + 1}. ${m.name} (${m.id})\n`));
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      while (!selected) {
+        const answer = await new Promise((resolve, reject) => {
+          const cancel = () => reject(Error("Model selection cancelled; run browse login to finish setup."));
+          rl.once("close", cancel);
+          rl.question("Model number or ID: ", (line) => {
+            rl.off("close", cancel); resolve(line.trim());
+          });
+        });
+        selected = models.find((m) => m.id === answer) || (/^\d+$/.test(answer) ? models[Number(answer) - 1] : undefined);
+        if (!selected) process.stdout.write("Choose a model from the list above.\n");
+      }
+    } finally { rl.close(); }
+  }
+  const saved = JSON.parse(fs.existsSync(p.auth) ? fs.readFileSync(p.auth, "utf8") : "{}");
+  const model = `chatgpt/${selected.id}`;
+  atomic(p.auth, JSON.stringify({ ...saved, model }, null, 2));
+  return { configured: true, provider: "chatgpt", model };
+}
+
+async function ensureAuth(p, options) {
   try {
-    auth(p, options.model);
+    await auth(p, options.model);
   } catch (e) {
     if (!process.stdin.isTTY) throw e;
-    await setup(p, options);
+    process.stderr.write(`${e.message}\n`);
+    if (options.provider && options.provider !== "chatgpt") await setup(p, options);
+    else {
+      const configured = await login(p, options);
+      options.model = configured.model;
+    }
   }
+}
+
+async function chat(p, options, initial) {
+  await ensureAuth(p, options);
   await ensureWorker(p);
   const rl = readline.createInterface({
     input: process.stdin,
@@ -277,6 +329,9 @@ export async function main(argv = process.argv.slice(2)) {
       home: { type: "string" },
       model: { type: "string" },
       provider: { type: "string" },
+      "new-account": { type: "boolean" },
+      account: { type: "string" },
+      list: { type: "boolean" },
       json: { type: "boolean" },
       quiet: { type: "boolean", short: "q" },
       verbose: { type: "boolean", short: "v" },
@@ -305,6 +360,12 @@ export async function main(argv = process.argv.slice(2)) {
     if (!fs.statSync(real).isFile()) throw Error("Attachment must be a file");
     return real;
   });
+  if (group === "login" || (group === "setup" && (!o.provider || o.provider === "chatgpt"))) {
+    if (o.list) { print(chatGPTAccounts(p), o); return; }
+    if (o.account && o["new-account"]) throw Error("Choose --account or --new-account.");
+    print(await login(p, o), o);
+    return;
+  }
   if (group === "setup") {
     print(await setup(p, o), o);
     return;
@@ -338,6 +399,10 @@ export async function main(argv = process.argv.slice(2)) {
       return;
     }
     throw Error("Use worker start|stop|status");
+  }
+  if (!a.length && !o.resume) {
+    await chat(p, o);
+    return;
   }
   await ensureWorker(p);
   const call = (method, args) => request(p, method, args);
@@ -496,11 +561,7 @@ export async function main(argv = process.argv.slice(2)) {
     await attach(p, run, o);
     return;
   }
-  if (!a.length) {
-    await chat(p, o);
-    return;
-  }
-  auth(p, o.model);
+  await ensureAuth(p, o);
   await attach(
     p,
     await call("submit", {

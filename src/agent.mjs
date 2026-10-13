@@ -53,7 +53,7 @@ export async function executeAgent({
   createAgent = createFxAgent,
   neo = new Neo(),
 }) {
-  const credential = auth(p, run.model);
+  const credential = await auth(p, run.model);
   run.model = credential.model;
   store.saveRun(run);
   const context = store.context(run.task),
@@ -423,7 +423,7 @@ export async function executeAgent({
 
 export async function compileWorkflow(p, name, description, model) {
   const agent = await createFxAgent({
-    ...providerOptions(auth(p, model)),
+    ...providerOptions(await auth(p, model)),
     instructions:
       'Return ONLY JSON for browse.workflow/v1: {format:"browse.workflow/v1",name,description,steps:[{type:"browser",task:"..."}|{type:"wait",duration:"2h"}|{type:"input",question:"..."}]}. Use browser steps for browser work and conditional browser decisions. Preserve user intent. No tools or code.',
   });

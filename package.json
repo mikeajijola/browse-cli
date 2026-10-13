@@ -15,11 +15,12 @@
     "start": "node bin/browse.mjs"
   },
   "dependencies": {
-    "libfx": "0.0.13",
+    "@ai-sdk/anthropic": "4.0.78",
     "@ai-sdk/google": "4.0.88",
     "@ai-sdk/openai": "4.0.91",
-    "@ai-sdk/anthropic": "4.0.78",
-    "ajv": "8.20.0"
+    "ajv": "8.20.0",
+    "jose": "6.2.12",
+    "libfx": "0.0.13"
   },
   "license": "Apache-2.0",
   "files": [

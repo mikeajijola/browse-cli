@@ -6,6 +6,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { atomic, json } from "./util.mjs";
 import { googleToolSchema } from "./google-tool-schema.mjs";
+import { chatGPTAuth } from "./chatgpt.mjs";
 
 const providers = {
   google: {
@@ -18,14 +19,16 @@ const providers = {
     env: ["ANTHROPIC_API_KEY"],
   },
 };
-export function auth(p, model) {
+export async function auth(p, model) {
   const saved = json(p.auth, {});
   model ||= saved.model;
   if (!model || !/^([a-z]+)\/[\w.-]+$/.test(model))
-    throw Error("Run browse setup with an explicit provider/model ID");
+    throw Error("Run browse login for ChatGPT, or browse setup --provider NAME --model ID for API-key access.");
   const [provider] = model.split("/"),
     spec = providers[provider];
-  if (!spec) throw Error("Supported providers: google, openai, anthropic");
+  if (provider === "chatgpt") return chatGPTAuth(p, model);
+  if (!Object.hasOwn(providers, provider))
+    throw Error("Supported providers: chatgpt, google, openai, anthropic");
   const apiKey =
     spec.env.map((key) => process.env[key]).find(Boolean) ||
     saved.credentials?.[provider];
@@ -33,9 +36,11 @@ export function auth(p, model) {
   return { provider, model, apiKey };
 }
 export async function setup(p, options = {}) {
-  let provider = options.provider,
+  let provider = options.provider?.trim().toLowerCase(),
     model = options.model,
     apiKey;
+  const unsupported = "Unsupported provider. Choose google, openai, or anthropic.";
+  if (provider && !Object.hasOwn(providers, provider)) throw Error(unsupported);
   if (!process.stdin.isTTY) {
     if (!provider || !model)
       throw Error("Noninteractive setup requires --provider and --model");
@@ -76,8 +81,13 @@ export async function setup(p, options = {}) {
         });
       });
     try {
-      provider ||= await ask("Provider (google/openai/anthropic): ");
-      if (!providers[provider]) throw Error("Unsupported provider");
+      while (!provider) {
+        const answer = (
+          await ask("Provider (google/openai/anthropic): ")
+        ).toLowerCase();
+        if (Object.hasOwn(providers, answer)) provider = answer;
+        else process.stdout.write(`${unsupported}\n`);
+      }
       model ||= await ask(
         "Model ID (no default; choose a vision/tool-capable model): ",
       );
@@ -89,7 +99,7 @@ export async function setup(p, options = {}) {
       rl.close();
     }
   }
-  if (!providers[provider]) throw Error("Unsupported provider");
+  if (!Object.hasOwn(providers, provider)) throw Error(unsupported);
   if (!model.includes("/")) model = `${provider}/${model}`;
   if (!model.startsWith(provider + "/") || !/^\w+\/[\w.-]+$/.test(model))
     throw Error("Provider/model mismatch");
@@ -153,6 +163,12 @@ export function providerOptions(options) {
       try {
         const { stream } = await model.doStream({
           ...body,
+          ...(options.chatgpt ? {
+            providerOptions: {
+              ...body.providerOptions,
+              openai: { ...body.providerOptions?.openai, store: false },
+            },
+          } : {}),
           ...(provider === "google" && body.tools
             ? {
                 tools: body.tools.map((t) =>
@@ -171,6 +187,12 @@ export function providerOptions(options) {
               transform(part, controller) {
                 if (part.type === "error")
                   throw Error("Provider stream failed");
+                if (options.chatgpt && part.type === "finish" &&
+                    !["stop", "tool-calls"].includes(part.finishReason?.unified)) {
+                  const error = Error("ChatGPT inference did not complete; try again or run browse login.");
+                  options.onError?.(error);
+                  throw error;
+                }
                 controller.enqueue(
                   new TextEncoder().encode(`data: ${JSON.stringify(part)}\n\n`),
                 );

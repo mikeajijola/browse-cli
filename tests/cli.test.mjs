@@ -10,6 +10,15 @@ import { request } from "../src/worker.mjs";
 const exec = promisify(execFile),
   bin = new URL("../bin/browse.mjs", import.meta.url).pathname;
 
+test("setup explains invalid model providers before requesting credentials", async () => {
+  for (const provider of ["Go to totaljobs and find enterprise architecture jobs", "toString"]) {
+    await assert.rejects(
+      exec(process.execPath, [bin, "setup", "--provider", provider, "--model", "test-model"]),
+      /Unsupported provider\. Choose google, openai, or anthropic\./,
+    );
+  }
+});
+
 test("installed CLI worker, portable memory, export/import and historical schedules", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "browse-cli-")),
     home = path.join(root, "home"),

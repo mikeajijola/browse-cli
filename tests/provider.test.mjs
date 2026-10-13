@@ -3,15 +3,40 @@ import assert from "node:assert/strict";
 import { createFxAgent } from "libfx";
 import { providerOptions } from "../src/provider.mjs";
 
-for (const provider of ["google", "openai", "anthropic"])
-  test(`real libfx streams and restores through the ${provider} adapter`, async () => {
+test("ChatGPT transport rejects a stream that ends without completed inference", async () => {
+  let failure;
+  const transport = providerOptions({
+    provider: "openai", model: "chatgpt/test-model", apiKey: "fixture-access", chatgpt: true,
+    onError: (error) => { failure = error; },
+    fetch: async () => new Response(
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_partial","created_at":1,"model":"test-model"}}\n\n',
+      { headers: { "content-type": "text/event-stream" } },
+    ),
+  });
+  const response = await transport.fetch("https://ai-gateway.vercel.sh/v4/ai/language-model", {
+    method: "POST",
+    body: JSON.stringify({ prompt: [{ role: "user", content: [{ type: "text", text: "Hi" }] }] }),
+  });
+  await assert.rejects(response.text(), /inference did not complete/);
+  assert.match(failure.message, /inference did not complete/);
+});
+
+for (const [provider, chatgpt] of [["google", false], ["openai", false], ["anthropic", false], ["openai", true]])
+  test(`real libfx streams and restores through the ${chatgpt ? "ChatGPT OAuth" : provider} adapter`, async () => {
     let requests = 0;
     const transport = providerOptions({
       provider,
+      chatgpt,
       apiKey: "private-test-key",
-      model: `${provider}/test-model`,
+      model: `${chatgpt ? "chatgpt" : provider}/test-model`,
       fetch: async (url, init) => {
         requests++;
+        if (chatgpt) {
+          const body = JSON.parse(init.body);
+          assert.equal(body.store, false);
+          assert.equal(body.stream, true);
+          assert.equal(new Headers(init.headers).get("authorization"), "Bearer private-test-key");
+        }
         assert.equal(
           new URL(String(url)).hostname,
           {

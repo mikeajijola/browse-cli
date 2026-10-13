@@ -12,9 +12,34 @@ Requires **Node.js 24+**, the **Fossil CLI**, and a running **BrowserOS Neo**.
 npm ci
 npm link
 browse --help
-browse setup --provider google --model YOUR_MODEL_ID
+browse                                  # Opens ChatGPT sign-in on first launch
 browse "Find and download my latest invoice"
 ```
+
+On first launch, Browse automatically opens **Continue with ChatGPT** in
+BrowserOS Neo. Sign in, allow Browse to use your ChatGPT plan, then choose a
+vision and tool-capable model from your account's current model list in the
+terminal. Browser tasks go at the `browse ›` prompt. Eligible ChatGPT accounts
+can use their plan through this official sign-in flow without an API key.
+If Neo cannot open the page, Browse prints a link to open on the same machine
+running the CLI. Remote browser loopback callbacks must reach that machine.
+
+```sh
+browse login                            # Sign in again
+browse login --new-account              # Add another account/workspace
+browse login --list                     # Show saved accounts
+browse login --account ACCOUNT_ID       # Reconnect an existing account
+browse login --model MODEL_ID            # Choose an available model explicitly
+browse setup --provider google --model YOUR_MODEL_ID  # API-key setup
+```
+
+ChatGPT credentials and a stable installation ID are saved under the Browse
+configuration directory with owner-only permissions, outside the portable
+workspace. Connections remain separate by issued client ID and verified account
+identity; login reuses the selected connection unless `--new-account` is supplied.
+Expired access tokens refresh automatically. OAuth consent and plan/model
+availability are determined by OpenAI. Browse uses the public Responses API with
+streaming enabled and response storage disabled for ChatGPT plan requests.
 
 Choose an existing vision and tool-capable model from Google, OpenAI, or Anthropic.
 Browse does not silently choose a model or route requests through AI Gateway.
@@ -225,7 +250,9 @@ history, diff and merge tools in the checkout. Remote publishing is never automa
 - Workspace: `$BROWSE_HOME`, `--home`, or `$XDG_DATA_HOME/browse`
   (default `~/.local/share/browse`).
 - Credentials: `$XDG_CONFIG_HOME/browse/auth.json`
-  (default `~/.config/browse/auth.json`). Credentials are shared across local workspaces.
+  (default `~/.config/browse/auth.json`); ChatGPT connections and the installation
+  ID are in `chatgpt.json` and `chatgpt-host.json` alongside it.
+  Credentials are shared across local workspaces.
 - Runtime: `runtime.sqlite`, `private/checkpoints`, worker socket, lock and log.
 - Portable repository: `workspace.fossil` and its `checkout`.
 
