@@ -12,20 +12,24 @@ Requires **Node.js 24+**, the **Fossil CLI**, and a running **BrowserOS Neo**.
 npm ci
 npm link
 browse --help
-browse                                  # Opens ChatGPT sign-in on first launch
+browse                                  # Choose a provider and enter its API key
 browse "Find and download my latest invoice"
 ```
 
-On first launch, Browse automatically opens **Continue with ChatGPT** in
-BrowserOS Neo. Sign in, allow Browse to use your ChatGPT plan, then choose a
-vision and tool-capable model from your account's current model list in the
-terminal. Browser tasks go at the `browse ›` prompt. Eligible ChatGPT accounts
-can use their plan through this official sign-in flow without an API key.
-If Neo cannot open the page, Browse prints a link to open on the same machine
-running the CLI. Remote browser loopback callbacks must reach that machine.
+On first launch, Browse offers Google/Gemini, OpenAI, and Anthropic/Claude.
+Choose a provider by number or name, enter its API key with hidden input, then
+enter a vision and tool-capable model ID. Browser tasks go at the `browse ›`
+prompt after setup. Run `browse setup` at any time to change providers.
+
+Optional ChatGPT browser sign-in is available through `browse login`. It opens
+**Continue with ChatGPT** in BrowserOS Neo, then lets you select a model from your
+account's current list. Eligible accounts can use their ChatGPT plan without an
+API key. If Neo cannot open the page, Browse prints a link to open on the same
+machine running the CLI. Remote browser loopback callbacks must reach that machine.
 
 ```sh
-browse login                            # Sign in again
+browse setup                            # Choose a provider and enter its API key
+browse login                            # Optional ChatGPT browser sign-in
 browse login --new-account              # Add another account/workspace
 browse login --list                     # Show saved accounts
 browse login --account ACCOUNT_ID       # Reconnect an existing account

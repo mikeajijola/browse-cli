@@ -23,7 +23,7 @@ export async function auth(p, model) {
   const saved = json(p.auth, {});
   model ||= saved.model;
   if (!model || !/^([a-z]+)\/[\w.-]+$/.test(model))
-    throw Error("Run browse login for ChatGPT, or browse setup --provider NAME --model ID for API-key access.");
+    throw Error("Run browse setup to choose a provider and enter its API key, or browse login for ChatGPT.");
   const [provider] = model.split("/"),
     spec = providers[provider];
   if (provider === "chatgpt") return chatGPTAuth(p, model);
@@ -81,19 +81,26 @@ export async function setup(p, options = {}) {
         });
       });
     try {
+      const choices = Object.keys(providers);
+      if (!provider) {
+        process.stdout.write("Choose your AI provider:\n  1. Google / Gemini\n  2. OpenAI\n  3. Anthropic / Claude\n");
+      }
       while (!provider) {
         const answer = (
-          await ask("Provider (google/openai/anthropic): ")
+          await ask("Provider number or name (google/openai/anthropic): ")
         ).toLowerCase();
         if (Object.hasOwn(providers, answer)) provider = answer;
+        else if (/^[1-3]$/.test(answer)) provider = choices[Number(answer) - 1];
+        else if (answer === "gemini") provider = "google";
+        else if (answer === "claude") provider = "anthropic";
         else process.stdout.write(`${unsupported}\n`);
       }
+      apiKey = await ask(
+        `${provider} API key (hidden, Enter uses environment/saved key): `,
+        true,
+      );
       model ||= await ask(
         "Model ID (no default; choose a vision/tool-capable model): ",
-      );
-      apiKey = await ask(
-        "API key (hidden, Enter uses environment/saved key): ",
-        true,
       );
     } finally {
       rl.close();

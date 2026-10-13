@@ -166,11 +166,9 @@ async function ensureAuth(p, options) {
   } catch (e) {
     if (!process.stdin.isTTY) throw e;
     process.stderr.write(`${e.message}\n`);
-    if (options.provider && options.provider !== "chatgpt") await setup(p, options);
-    else {
-      const configured = await login(p, options);
-      options.model = configured.model;
-    }
+    const configured = options.provider === "chatgpt"
+      ? await login(p, options) : await setup(p, options);
+    options.model = configured.model;
   }
 }
 
@@ -360,7 +358,7 @@ export async function main(argv = process.argv.slice(2)) {
     if (!fs.statSync(real).isFile()) throw Error("Attachment must be a file");
     return real;
   });
-  if (group === "login" || (group === "setup" && (!o.provider || o.provider === "chatgpt"))) {
+  if (group === "login" || (group === "setup" && o.provider === "chatgpt")) {
     if (o.list) { print(chatGPTAccounts(p), o); return; }
     if (o.account && o["new-account"]) throw Error("Choose --account or --new-account.");
     print(await login(p, o), o);
