@@ -6,56 +6,45 @@ Fossil carries the workspace's skills, learned context, workflows, and artifacts
 
 ## Install
 
-Requires **Node.js 24+**, the **Fossil CLI**, and a running **BrowserOS Neo**.
+Requires **Node.js 24+**, **Zig 0.17.0** to build the frontend, the **Fossil CLI**,
+and a running **BrowserOS Neo**.
 
 ```sh
 npm ci
+npm run build:frontend             # Set ZIG=/path/to/zig if it is not on PATH
 npm link
-browse --help
-browse                                  # Choose a provider and enter its API key
-browse "Find and download my latest invoice"
+browse
 ```
 
-On first launch, Browse offers Google/Gemini, OpenAI, and Anthropic/Claude.
-Choose a provider by number or name, enter its API key with hidden input, then
-pick a model from the provider's live list. Browse checks your key and model before
-opening chat, and offers a replacement if a saved model is unavailable. Browser tasks go at the `browse ›`
-prompt after setup. Run `browse setup` at any time to change providers.
+Browse uses the actual native terminal frontend from
+[vercel-labs/fx](https://github.com/vercel-labs/fx), pinned to
+`f1ab492975df66b360acc7773ba2479a4a397272` (fx 0.0.14). The welcome screen,
+pickers, model selection, composer, shortcuts, themes,
+and Markdown renderer come from that source, rebranded for Browse.
+The frontend calls Browse's durable browser worker for execution.
 
-Optional ChatGPT browser sign-in is available through `browse login`. It opens
-**Continue with ChatGPT** in BrowserOS Neo, then lets you select a model from your
-account's current list. Eligible accounts can use their ChatGPT plan without an
-API key. If Neo cannot open the page, Browse prints a link to open on the same
-machine running the CLI. Remote browser loopback callbacks must reach that machine.
+First launch offers token setup for **Vercel AI Gateway**, **OpenAI**,
+**Anthropic**, **Google Gemini**, **xAI**, **OpenRouter**, and a
+**custom OpenAI-compatible endpoint**. Choose a provider, paste its token into
+the hidden input, and select a model in the native picker. Custom endpoints
+ask for an API base URL first, such as `https://example.com/v1`; HTTP is allowed
+for localhost. Setup checks model access without generating a chat completion.
+Use `browse setup` or `/setup` to add or replace a connection and `/model` to
+switch between models from saved providers. Provider tokens are saved in the
+owner-only `~/.browse-fx/browse-tokens.json` file. Treat this file as a secret;
+it is outside the portable Browse workspace.
 
-```sh
-browse setup                            # Choose a provider and enter its API key
-browse login                            # Optional ChatGPT browser sign-in
-browse login --new-account              # Add another account/workspace
-browse login --list                     # Show saved accounts
-browse login --account ACCOUNT_ID       # Reconnect an existing account
-browse login --model MODEL_ID            # Choose an available model explicitly
-browse setup --provider google --model YOUR_MODEL_ID  # API-key setup
-```
+Frontend settings, connections and sessions live under `~/.browse-fx`, separately
+from an existing fx installation. Native macOS Keychain entries use Browse's own
+service names. Automatic fx upgrades are disabled because the frontend must keep
+its Browse execution bridge. Rebuild from the pinned source to update it.
 
-ChatGPT credentials and a stable installation ID are saved under the Browse
-configuration directory with owner-only permissions, outside the portable
-workspace. Connections remain separate by issued client ID and verified account
-identity; login reuses the selected connection unless `--new-account` is supplied.
-Expired access tokens refresh automatically. OAuth consent and plan/model
-availability are determined by OpenAI. Browse uses the public Responses API with
-streaming enabled and response storage disabled for ChatGPT plan requests.
-
-Choose an existing vision and tool-capable model from Google, OpenAI, or Anthropic.
-Browse does not silently choose a model or route requests through AI Gateway.
-API keys are entered with hidden input. Noninteractive setup uses
-`GEMINI_API_KEY` / `GOOGLE_GENERATIVE_AI_API_KEY`, `OPENAI_API_KEY`, or
-`ANTHROPIC_API_KEY`, and requires `--provider` and `--model`.
-
-If your default Node is older, install Node 24 or run commands with:
+The original direct Google, OpenAI and Anthropic provider setup and existing
+ChatGPT connections remain accessible through the `durable` namespace:
 
 ```sh
-npx --yes --package=node@24 node bin/browse.mjs --help
+browse durable setup --provider google --model YOUR_MODEL_ID
+browse durable login --list
 ```
 
 The Neo MCP endpoint defaults to `http://127.0.0.1:9010/mcp`.
@@ -64,11 +53,10 @@ Set `BROWSE_NEO_URL` to override it. Browse never silently switches browsers.
 ## Run browser tasks
 
 ```sh
-browse                                      # Reopen your ongoing conversation
-browse "Search the website and write report.md"  # Another turn in the same conversation
-browse "Upload the report to this form" --attach ./report.pdf
-browse "Download my invoices" --detach
-browse --resume RUN_ID
+browse                                      # Open Browse's native terminal
+browse "Search the website and write report.md"
+browse --continue                           # Continue the remembered native session
+browse --resume last                        # Resume the latest native session
 browse runs list
 browse runs show RUN_ID
 browse runs logs RUN_ID
@@ -78,20 +66,34 @@ browse runs cancel RUN_ID
 browse respond RUN_ID "Use my personal account"
 ```
 
-Type while an interactive turn is running to steer it. `/stop` cancels the current
-task; `/new` explicitly starts a separate conversation and retains the old history.
-Closing and reopening `browse` keeps the same conversation, shows recent messages,
-and reconnects to an active turn or pending question. `/help`, `/status`, `/reconnect`, and
-`/exit` are also available. Answer a pending question by typing a message.
-Use Up/Down Arrow to recall and edit your previous messages, including after
-restarting Browse. Recall is scoped to the current conversation; `/new` starts
-with an empty input history.
+Use `/help` for the native command and keyboard reference. `/setup` opens connections,
+`/model` opens model selection, `/new` creates a fresh session, and `/resume`
+opens saved sessions. The native editor handles multiline input, paste, history,
+and editing while responses stream. Ctrl+O toggles full tool detail. Double
+Escape interrupts the current task. Closing the terminal detaches durable work;
+cancellation does not undo browser actions.
 
-Closing the terminal detaches work. Ctrl+C during attached execution cancels the
-active task. Cancellation does not undo browser actions. Browser tabs are retained.
-`--quiet` suppresses routine progress; `--verbose` shows event types without raw
-tool arguments. `--json` emits machine-readable output, with JSONL events for
-attached runs. Stored transcripts and tool results may contain personal data.
+Native session IDs map to separate Browse conversations. Prompts, steering,
+question answers, text deltas, tool outcomes and explicit interrupts cross a
+private JSONL pipe. Credentials stay in owner-only private storage and do not
+enter portable run records or command arguments. Browse's worker retains
+contracts, evidence, artifacts, retry and recovery behavior.
+
+The terminal is an fx frontend over Browse's browser-only execution engine.
+Native fx shell tools, coding permissions, MCP and skill registries, and context
+compaction do not control Browse's worker. Use Browse's durable commands for its
+skills, memory, and run management. Native title generation and billing requests
+are disabled; provider tokens are used by Browse's inference adapters.
+
+Browse's durable management commands continue to work. `browse durable` explicitly
+selects the previous command interface when a command or flag overlaps fx:
+
+```sh
+browse durable "Upload the report to this form" --attach ./report.pdf
+browse durable "Download my invoices" --detach
+browse durable --resume RUN_ID
+browse durable --help
+```
 
 The full conversation transcript is stored as **`checkout/history.sqlite`**, a
 self-contained SQLite artifact versioned in Fossil. It contains conversations and
@@ -136,10 +138,37 @@ and fresh observations. Uncertain submissions, clicks, uploads, and scripts are 
 blindly retried. Recovery initially permits read-only browser observations; an
 action can be reconciled only with recorded observation IDs and evidence.
 
-There is no exactly-once guarantee for external websites. When evidence is
-insufficient, the run waits for you. A turn is bounded to 120 browser calls and
-15 minutes; workflows provide longer-lived execution through multiple steps and
-durable waits. Schedules catch up once, rather than replaying all missed intervals.
+There is no exactly-once guarantee for external websites. Recovery inspects an
+uncertain outcome before further action; the agent requests input when that
+inspection cannot resolve it. Transient transport and provider failures retry
+with exponential backoff capped at 60 seconds. Permanent configuration and
+authentication errors are reported. Schedules catch up once, rather than replaying
+all missed intervals.
+
+## Execution contracts
+
+For multi-step or batch browser tasks, the agent records an objective and explicit
+completion criteria with `contract_revise`. Each immutable revision references a
+saved user instruction. Follow-up requests can extend or revise the objective;
+unchanged criteria retain their evidence. Questions do not authorize scope changes.
+
+`contract_record` attaches completed read-only browser observations or saved
+artifacts to a criterion. Browse checks observation ownership and completion,
+artifact provenance and actual file hashes. The agent remains responsible for
+deciding whether that evidence satisfies the requested result. This is a general
+evidence ledger, rather than a domain-specific submission receipt validator.
+
+Unfinished contracts continue across normal model replies and worker restarts.
+A reply alone does not complete the task. Completed contracts block additional
+browser mutations until the objective is revised for newly requested work.
+`require_input` saves a genuine blocker and `workflow_wait` saves a durable delay.
+There is no host-imposed turn duration, tool-count or no-progress cutoff; individual
+network requests still have transport timeouts, and `/stop` remains effective.
+Simple questions do not need a contract.
+
+Contract revisions and progress are versioned in Fossil under
+`contracts/<run-id>/v<version>.json` and `contracts/<run-id>/progress.json`.
+`/contract` shows criteria and evidence; `/status` and the activity row show counts.
 
 ## Workflows and schedules
 
@@ -275,20 +304,22 @@ history, diff and merge tools in the checkout. Remote publishing is never automa
 
 - Workspace: `$BROWSE_HOME`, `--home`, or `$XDG_DATA_HOME/browse`
   (default `~/.local/share/browse`).
-- Credentials: `$XDG_CONFIG_HOME/browse/auth.json`
+- Native frontend: `~/.browse-fx` (isolated test profiles may set `BROWSE_PROFILE_HOME`).
+- Native worker credential leases: `private/frontend-credentials` (never exported).
+- Legacy credentials: `$XDG_CONFIG_HOME/browse/auth.json`
   (default `~/.config/browse/auth.json`); ChatGPT connections and the installation
   ID are in `chatgpt.json` and `chatgpt-host.json` alongside it.
   Credentials are shared across local workspaces.
 - Runtime: `runtime.sqlite`, `private/checkpoints`, worker socket, lock and log.
 - Portable repository: `workspace.fossil` and its `checkout`.
 
-Directories and private files use owner-only permissions. The npm package ships
-code and examples only; your Fossil workspace travels separately. Personal
+Directories and private files use owner-only permissions. The npm package includes the frontend binary built for its target platform; your Fossil workspace travels separately. Personal
 transcripts and artifacts are included in workspace exports and explicit syncs.
 
 ## Verification
 
 ```sh
+npm run build:frontend
 npm test
 npm run test:browser
 ```

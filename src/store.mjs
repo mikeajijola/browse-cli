@@ -83,6 +83,29 @@ export class Store {
     const active = this.meta("activeConversation");
     return active ? this.db.prepare("SELECT * FROM conversations WHERE id=?").get(active) || null : null;
   }
+  conversations() {
+    return this.db.prepare(`SELECT c.*,
+      (SELECT content FROM messages WHERE conversation_id=c.id AND role='user' ORDER BY ordinal LIMIT 1) AS title,
+      (SELECT count(*) FROM messages WHERE conversation_id=c.id) AS message_count
+      FROM conversations c ORDER BY updated_at DESC,id`).all()
+      .map((row) => ({ ...row, title: (row.title || "New conversation").replace(/\s+/g, " ").slice(0, 100) }));
+  }
+  selectConversation(id) {
+    if (!this.db.prepare("SELECT id FROM conversations WHERE id=?").get(id)) throw Error("Conversation not found");
+    this.setMeta("activeConversation", id);
+    this.historyChanged();
+    return this.conversation();
+  }
+  conversationPage(conversationId, { before = Number.MAX_SAFE_INTEGER, limit = 20 } = {}) {
+    if (!Number.isSafeInteger(before) || before < 1 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+      throw Error("Invalid history page");
+    const messages = this.db.prepare("SELECT * FROM messages WHERE conversation_id=? AND ordinal<? ORDER BY ordinal DESC LIMIT ?")
+      .all(conversationId, before, limit + 1);
+    const more = messages.length > limit;
+    if (more) messages.pop();
+    messages.reverse();
+    return { messages, before: more ? messages[0].ordinal : null };
+  }
   newConversation() {
     const conversation = { id: id(), created_at: now(), updated_at: now(), run_id: null };
     this.tx(() => {
@@ -101,16 +124,23 @@ export class Store {
     const row = this.db.prepare("SELECT data FROM runs WHERE id=?").get(runId);
     const run = row && JSON.parse(row.data);
     if (!run?.conversationId) return;
-    if (event.type === "running") this.setMeta(`historyTurn:${runId}`, String(seq));
+    if (event.type === "running") {
+      this.setMeta(`historyTurn:${runId}`, String(seq));
+      this.setMeta(`historyStreamed:${runId}`, "0");
+    }
+    if (event.type === "steering_applied") this.setMeta(`historyTurn:${runId}`, String(seq));
+    if (event.type === "text_delta") this.setMeta(`historyStreamed:${runId}`, "1");
     let role, content, messageId;
     if (["queued", "user_message", "response", "steering"].includes(event.type)) {
       role = "user";
       content = event.task ?? event.text ?? event.answer;
       messageId = `${runId}:user:${seq}`;
     } else if (event.type === "text_delta" || event.answer || event.question || event.error) {
+      if (event.answer && !event.question && !event.error && this.meta(`historyStreamed:${runId}`) === "1") return;
       role = event.error ? "system" : "assistant";
-      content = event.delta ?? event.answer ?? event.question ?? event.error;
+      content = event.delta ?? event.question ?? event.answer ?? event.error;
       messageId = event.error ? `${runId}:error:${seq}`
+        : event.question ? `${runId}:question:${seq}`
         : `${runId}:assistant:${this.meta(`historyTurn:${runId}`) || seq}`;
     }
     if (typeof content !== "string" || !content) return;

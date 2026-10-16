@@ -17,8 +17,9 @@ import {
 import { Store } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
 import { executeAgent, compileWorkflow } from "./agent.mjs";
+import { contractProgress, readContract } from "./contract.mjs";
 
-const WORKER_PROTOCOL = 3;
+const WORKER_PROTOCOL = 6;
 
 export function request(p, method, params = {}, timeout = 90000) {
   return new Promise((resolve, reject) => {
@@ -103,7 +104,7 @@ export async function ensureWorker(p) {
 }
 
 export class Worker {
-  constructor(p, { agent = executeAgent, compiler = compileWorkflow } = {}) {
+  constructor(p, { agent = executeAgent, compiler = compileWorkflow, retryDelayMs = 1000 } = {}) {
     this.p = p;
     this.store = new Store(p);
     this.workspace = new Workspace(p, this.store);
@@ -112,6 +113,8 @@ export class Worker {
     this.active = null;
     this.turn = null;
     this.stopping = false;
+    this.retryDelayMs = retryDelayMs;
+    this.deliveredSteering = new Set();
   }
   initialize() {
     this.workspace.init();
@@ -141,6 +144,7 @@ export class Worker {
       publicationError: this.publicationError,
       pendingPublications: this.store.pending().length,
       conversation: this.store.conversation()?.id,
+      progress: (() => { const c = this.store.conversation(); return c?.run_id ? contractProgress(this.store.run(c.run_id).contract) : null; })(),
     };
   }
   async dispatch(method, args = {}) {
@@ -186,10 +190,38 @@ export class Worker {
       }
       case "conversation_new":
         return this.store.newConversation();
+      case "conversations":
+        return this.store.conversations();
+      case "conversation_select":
+        this.store.selectConversation(args.id);
+        return this.dispatch("conversation_open");
+      case "conversation_history":
+        return this.store.conversationPage(args.id || this.store.conversation()?.id, args);
+      case "conversation_search":
+        return this.store.conversationSearch(args.id || this.store.conversation()?.id, args.query);
+      case "contract":
+        return readContract(this.store, args.id);
+      case "frontend_submit": {
+        if (typeof args.session !== "string" || !/^[\w-]{1,160}$/.test(args.session))
+          throw Error("Invalid frontend session");
+        const key = `frontend:${args.session}`;
+        let conversationId = this.store.meta(key);
+        if (!conversationId) {
+          conversationId = this.store.newConversation().id;
+          this.store.setMeta(key, conversationId);
+        }
+        const conversation = this.store.db.prepare("SELECT * FROM conversations WHERE id=?").get(conversationId);
+        const after = conversation.run_id ? this.store.eventCursor(conversation.run_id) : 0;
+        const run = await this.dispatch("conversation_submit", { ...args, conversationId });
+        return { run, after: run.id === conversation.run_id ? after : 0 };
+      }
       case "conversation_submit": {
         if (typeof args.task !== "string" || !args.task.trim() || args.task.length > 64000)
           throw Error("Instruction must be nonempty and at most 64000 characters");
-        const conversation = this.store.conversation() || this.store.newConversation();
+        const conversation = args.conversationId
+          ? this.store.db.prepare("SELECT * FROM conversations WHERE id=?").get(args.conversationId)
+          : this.store.conversation() || this.store.newConversation();
+        if (!conversation) throw Error("Conversation not found");
         const run = conversation.run_id ? this.store.run(conversation.run_id) : null;
         if (!run || run.historical) {
           return this.store.createRun(args.task, { ...args, conversationId: conversation.id });
@@ -197,7 +229,7 @@ export class Worker {
         if (run.question) return this.dispatch("respond", { ...args, id: run.id, answer: args.task });
         if (TERMINAL.has(run.state) || run.state === "paused")
           return this.dispatch("continue", { ...args, id: run.id });
-        await this.dispatch("steer", { id: run.id, text: args.task });
+        await this.dispatch("steer", { id: run.id, text: args.task, attachments: args.attachments });
         return this.store.run(run.id);
       }
       case "runs":
@@ -216,6 +248,10 @@ export class Worker {
         const run = this.store.run(args.id);
         if (run.historical) throw Error("Imported history cannot execute");
         run.state = method === "pause" ? "paused" : "cancelled";
+        if (method === "cancel") {
+          delete run.question; delete run.questionOptions; delete run.wakeAt;
+          for (const input of run.inputs) if (input.applied === false) input.discarded = true;
+        }
         if (this.active?.id === run.id) {
           run.recoveryNeeded = true;
           this.active.controller.abort();
@@ -249,7 +285,7 @@ export class Worker {
       }
       case "respond": {
         const run = this.store.run(args.id);
-        if (run.historical || run.state !== "waiting" || !run.question)
+        if (run.historical || !["waiting", "paused"].includes(run.state) || !run.question)
           throw Error("Run is not waiting for input");
         run.inputs.push({
           question: run.question,
@@ -257,6 +293,8 @@ export class Worker {
           at: now(),
         });
         delete run.question;
+        delete run.questionOptions;
+        if (args.attachments?.length) run.attachments = [...new Set([...run.attachments, ...args.attachments])];
         run.state = "queued";
         if (args.model) run.model = args.model;
         // User answers authorize another read-only recovery pass; they never silently mark a browser action successful.
@@ -268,11 +306,15 @@ export class Worker {
         const run = this.store.run(args.id);
         if (run.historical || !["running", "queued", "waiting"].includes(run.state))
           throw Error("No active turn; use continue");
+        if (typeof args.text !== "string" || !args.text.trim() || args.text.length > 64000)
+          throw Error("Steering must be nonempty and at most 64000 characters");
         this.store.event(run.id, "steering", { text: args.text });
-        run.inputs.push({ steering: args.text, at: now() });
+        run.inputs.push({ id: id(), steering: args.text, at: now(), applied: false,
+          ...(args.attachments?.length ? { modelText: `${args.text}\n\nExplicit attachments for this message: ${JSON.stringify(args.attachments)}` } : {}) });
+        if (args.attachments?.length) run.attachments = [...new Set([...run.attachments, ...args.attachments])];
         this.store.saveRun(run);
         if (this.active?.id === run.id && this.turn)
-          await this.turn.steer(args.text);
+          await this.deliverSteering(run.id, this.turn);
         return { accepted: true };
       }
       case "continue": {
@@ -442,6 +484,17 @@ export class Worker {
         throw Error(`Unknown worker operation: ${method}`);
     }
   }
+  async deliverSteering(runId, turn) {
+    for (const input of this.store.run(runId).inputs) {
+      if (!input.steering || input.discarded || input.applied !== false || this.deliveredSteering.has(input.id)) continue;
+      this.deliveredSteering.add(input.id);
+      try { await turn.steer(input.modelText || input.steering); }
+      catch (error) {
+        this.deliveredSteering.delete(input.id);
+        if (error.code !== "FX_TURN_SETTLED" && !/no prompt is running/i.test(error.message)) throw error;
+      }
+    }
+  }
   async tick() {
     if (this.stopping || this.active) return;
     try {
@@ -502,6 +555,7 @@ export class Worker {
     }
     const controller = new AbortController();
     this.active = { id: run.id, controller };
+    this.deliveredSteering.clear();
     run.state = "running";
     this.store.saveRun(run);
     this.store.event(run.id, "running", { step: run.step });
@@ -511,44 +565,54 @@ export class Worker {
         store: this.store,
         workspace: this.workspace,
         run,
-        signal: AbortSignal.any([
-          controller.signal,
-          AbortSignal.timeout(15 * 60 * 1000),
-        ]),
-        onTurn: (t) => {
+        signal: controller.signal,
+        onTurn: async (t) => {
           this.turn = t;
+          if (t && !run.recoveryNeeded) await this.deliverSteering(run.id, t);
         },
       });
       const current = this.store.run(run.id);
       run.inputs = current.inputs;
+      run.attachments = current.attachments;
+      run.contract = current.contract;
       if (current.state !== "running") return;
       run.answer = outcome.answer;
       run.usage = outcome.result?.usage;
-      if (!outcome.recovery && outcome.unresolved?.length) {
-        run.state = "waiting";
-        run.recoveryNeeded = true;
-        run.question =
-          "A browser action returned an uncertain outcome. Describe what you see; Browse will inspect before continuing.";
+      run.retryCount = 0;
+      delete run.error;
+      delete run.question;
+      delete run.questionOptions;
+      if (outcome.unresolved?.length) run.recoveryNeeded = true;
+      if (!outcome.recovery && outcome.unresolved?.length && !["input", "wait"].includes(outcome.control?.type)) {
+        run.state = "queued";
+        this.store.event(run.id, "recovery", { reason: "Checking an uncertain browser outcome" });
       } else if (outcome.control?.type === "input") {
         run.state = "waiting";
         run.question = outcome.control.question;
+        run.questionOptions = outcome.control.options;
       } else if (outcome.control?.type === "wait") {
         run.state = "waiting";
         run.wakeAt = Date.now() + outcome.control.milliseconds;
       } else if (outcome.recovery) {
-        run.recoveryNeeded = outcome.unresolved?.length > 0;
-        run.state = run.recoveryNeeded ? "waiting" : "queued";
-        if (run.recoveryNeeded)
-          run.question =
-            "An interrupted browser action is still uncertain. Inspect the browser and describe its outcome.";
+        run.recoveryNeeded = this.store.actions(run.id).some((action) => action.effectful && action.state === "dispatched");
+        run.state = "queued";
       } else {
-        run.step++;
-        run.state = run.step >= run.steps.length ? "completed" : "queued";
+        const pendingSteering = run.inputs.some((input) => input.steering && !input.discarded && input.applied === false);
+        const progress = contractProgress(run.contract);
+        if ((progress && !progress.complete) || pendingSteering) {
+          run.state = "queued";
+          run.slices = (run.slices || 0) + 1;
+          this.store.event(run.id, "continuing", { reason: pendingSteering ? "Applying your follow-up" : "Completion criteria remain", progress });
+        } else {
+          run.step++;
+          run.state = run.step >= run.steps.length ? "completed" : "queued";
+        }
       }
       this.store.saveRun(run);
       this.store.event(run.id, run.state, {
         answer: run.answer,
         question: run.question,
+        questionOptions: run.questionOptions,
         wakeAt: run.wakeAt,
       });
       if (run.state === "completed")
@@ -558,7 +622,7 @@ export class Worker {
             runId: run.id,
             task: run.task,
             answer: run.answer,
-            assessment: "agent_reported",
+            assessment: run.contract ? "contract_evidence_recorded" : "agent_reported",
             actionIds: this.store.actions(run.id).map((a) => a.id),
           },
           {
@@ -578,14 +642,17 @@ export class Worker {
         const uncertain = this.store
           .actions(run.id)
           .some((a) => a.state === "dispatched" && a.effectful);
-        current.recoveryNeeded = true;
-        current.state = uncertain
-          ? "waiting"
-          : controller.signal.aborted
-            ? "paused"
-            : "failed";
+        const transient = Boolean(e.transient) || /timeout|timed out|network|fetch failed|HTTP (429|500|502|503|504)|Provider request failed \((429|500|502|503|504)\)/i.test(e.message);
+        const retry = !controller.signal.aborted && transient;
+        current.recoveryNeeded = uncertain;
+        current.state = controller.signal.aborted ? "paused" : retry ? "waiting" : uncertain ? "waiting" : "failed";
         current.error = e.message;
-        if (uncertain)
+        if (retry) {
+          current.retryCount = (current.retryCount || 0) + 1;
+          current.wakeAt = Date.now() + Math.min(60000, this.retryDelayMs * 2 ** Math.min(current.retryCount - 1, 16));
+          delete current.question;
+          this.store.event(run.id, "retrying", { reason: e.message, wakeAt: current.wakeAt, attempt: current.retryCount });
+        } else if (uncertain)
           current.question =
             "A browser action may have executed before interruption. Describe what you see; Browse will inspect before continuing.";
         this.store.saveRun(current);

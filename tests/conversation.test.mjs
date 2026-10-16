@@ -129,6 +129,27 @@ test("explicit new conversation retains the previous transcript and does not reu
   assert.equal(f.worker.store.conversationMessages(old.conversationId).length, 2);
 });
 
+test("saved conversations can be selected and their full history paged without gaps", async (t) => {
+  const f = fixture(t);
+  const run = await f.worker.dispatch("conversation_submit", { task: "First conversation" });
+  await f.worker.tick();
+  await f.worker.dispatch("conversation_new");
+  await f.worker.dispatch("conversation_submit", { task: "Another conversation" });
+  await f.worker.tick();
+  const conversations = await f.worker.dispatch("conversations");
+  assert.equal(conversations.length, 2);
+  assert.ok(conversations.some((item) => item.title === "First conversation"));
+  const opened = await f.worker.dispatch("conversation_select", { id: run.conversationId });
+  assert.equal(opened.run.id, run.id);
+  const latest = await f.worker.dispatch("conversation_history", { limit: 1 });
+  const older = await f.worker.dispatch("conversation_history", { limit: 1, before: latest.before });
+  assert.equal(latest.messages[0].role, "assistant");
+  assert.equal(older.messages[0].role, "user");
+  assert.equal(older.before, null);
+  assert.equal((await f.worker.dispatch("conversation_search", { query: "First conversation" })).length, 2);
+  assert.equal(f.restart().store.conversation().id, run.conversationId);
+});
+
 test("reopened conversation accepts a pending answer instead of creating a separate run", async (t) => {
   let calls = 0;
   const f = fixture(t, async (options) => ++calls === 1
@@ -144,6 +165,49 @@ test("reopened conversation accepts a pending answer instead of creating a separ
   await f.worker.tick();
   assert.equal(f.worker.store.run(run.id).inputs[0].answer, "Personal");
   assert.ok(f.worker.store.conversationMessages(run.conversationId).some((m) => m.content === "Personal"));
+});
+
+test("steering queued before agent startup is delivered once and acknowledged durably", async (t) => {
+  const steers = [];
+  const f = fixture(t, (options) => executeAgent({ ...options,
+    neo: { tools: [], async ready() {} },
+    createAgent: async () => ({
+      prompt() {
+        const messages = [];
+        return { result: Promise.resolve({ stopReason: "end_turn", usage: {} }),
+          async steer(text) { steers.push(text); messages.push({ type: "user_message", text }); },
+          async *[Symbol.asyncIterator]() { yield* messages; yield { type: "text_delta", delta: "Applied your correction" }; } };
+      }, async checkpoint() { return Buffer.from("checkpoint"); }, async close() {},
+    }),
+  }));
+  f.p.auth = path.join(f.p.private, "auth.json");
+  atomic(f.p.auth, JSON.stringify({ model: "google/test", credentials: { google: "fixture" } }));
+  const run = await f.worker.dispatch("conversation_submit", { task: "Find invoices", model: "google/test" });
+  const file = path.join(f.p.root, "notes.txt"); fs.writeFileSync(file, "This month only");
+  await f.worker.dispatch("conversation_submit", { task: "Only this month", attachments: [file] });
+  assert.equal(f.worker.store.run(run.id).inputs[0].applied, false);
+  await f.worker.tick();
+  assert.equal(steers.length, 1);
+  assert.ok(steers[0].includes("Only this month"));
+  assert.ok(steers[0].includes(file));
+  assert.equal(f.worker.store.run(run.id).inputs[0].applied, true);
+  assert.equal(f.worker.store.run(run.id).state, "completed");
+  assert.equal(f.worker.store.events(run.id).filter((event) => event.type === "steering_applied").length, 1);
+  assert.equal(f.worker.store.events(run.id).find((event) => event.type === "steering_applied").text, "Only this month");
+});
+
+test("saved replies keep their order around mid-turn steering without repeating the final answer", async (t) => {
+  const f = fixture(t);
+  const run = await f.worker.dispatch("conversation_submit", { task: "Find invoices" });
+  f.worker.store.event(run.id, "running");
+  f.worker.store.event(run.id, "text_delta", { delta: "Before correction" });
+  await f.worker.dispatch("steer", { id: run.id, text: "Only this month" });
+  f.worker.store.event(run.id, "steering_applied", { text: "Only this month" });
+  f.worker.store.event(run.id, "text_delta", { delta: "After correction" });
+  f.worker.store.event(run.id, "completed", { answer: "Before correctionAfter correction" });
+  assert.deepEqual(f.worker.store.conversationMessages(run.conversationId).map((message) => [message.role, message.content]), [
+    ["user", "Find invoices"], ["assistant", "Before correction"], ["user", "Only this month"], ["assistant", "After correction"],
+  ]);
 });
 
 test("conversation snapshot publication retries safely after commit acknowledgement failure", async (t) => {

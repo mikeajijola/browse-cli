@@ -12,7 +12,8 @@
   "scripts": {
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "test:browser": "node tests/live-browser.mjs",
-    "start": "node bin/browse.mjs"
+    "start": "node bin/browse.mjs",
+    "build:frontend": "node scripts/build-frontend.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "4.0.78",
@@ -28,6 +29,9 @@
     "src",
     "examples",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "native/bin",
+    "native/fx",
+    "scripts/build-frontend.mjs"
   ]
 }

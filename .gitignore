@@ -4,3 +4,6 @@ node_modules/
 *.sqlite*
 coverage/
 .browse/
+.browse-fx/
+native/.cache/
+native/bin/

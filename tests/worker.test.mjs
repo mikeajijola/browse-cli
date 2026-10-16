@@ -57,6 +57,7 @@ test("uncertain side effects pause and enter read-only recovery", async (t) => {
     return {
       answer: "Unclear",
       recovery: true,
+      control: { type: "input", question: "The submission is still uncertain. Which page do you see?" },
       unresolved: store.actions(run.id).filter((a) => a.state === "dispatched"),
     };
   });
@@ -65,6 +66,14 @@ test("uncertain side effects pause and enter read-only recovery", async (t) => {
   assert.equal(worker.store.run(run.id).state, "waiting");
   assert.equal(worker.store.actions(run.id).length, 1);
   assert.equal(worker.store.run(run.id).recoveryNeeded, true);
+  // Transport failure retries automatically into read-only recovery. The model
+  // asks for a person only after observations leave the outcome uncertain.
+  const retry = worker.store.run(run.id);
+  assert.equal(retry.question, undefined);
+  retry.wakeAt = Date.now() - 1;
+  worker.store.saveRun(retry);
+  await worker.tick();
+  assert.match(worker.store.run(run.id).question, /uncertain/);
   await worker.dispatch("respond", {
     id: run.id,
     answer: "I see a confirmation",
@@ -185,4 +194,37 @@ test("a fresh worker restores durable waits from SQLite", async (t) => {
   await w2.tick();
   assert.equal(calls, 1);
   assert.equal(w2.store.run(run.id).state, "completed");
+});
+
+test("cancelled questions and queued steering do not leak into a new request", async (t) => {
+  const worker = fixture(t, success);
+  const run = await worker.dispatch("conversation_submit", { task: "Original task" });
+  await worker.dispatch("steer", { id: run.id, text: "Old correction" });
+  await worker.dispatch("cancel", { id: run.id });
+  const next = await worker.dispatch("conversation_submit", { task: "New task" });
+  await worker.tick();
+  assert.equal(worker.store.run(next.id).state, "completed");
+  assert.equal(worker.store.run(next.id).inputs[0].discarded, true);
+  worker.agent = async () => ({ control: { type: "input", question: "Which account?", options: ["Personal", "Work"] } });
+  await worker.dispatch("conversation_submit", { task: "Ask account" });
+  await worker.tick();
+  assert.deepEqual(worker.store.run(next.id).questionOptions, ["Personal", "Work"]);
+  await worker.dispatch("cancel", { id: next.id });
+  assert.equal(worker.store.run(next.id).question, undefined);
+  assert.equal(worker.store.run(next.id).questionOptions, undefined);
+  assert.equal((await worker.dispatch("conversation_submit", { task: "A different task" })).state, "queued");
+});
+
+test("native frontend sessions route to separate durable conversations despite active conversation changes", async (t) => {
+  const worker = fixture(t, success);
+  const one = await worker.dispatch("frontend_submit", { session: "session-one", task: "Read account one", model: "fx:gateway:anthropic/claude" });
+  await worker.tick();
+  const two = await worker.dispatch("frontend_submit", { session: "session-two", task: "Read account two", model: "fx:gateway:anthropic/claude" });
+  await worker.tick();
+  const followup = await worker.dispatch("frontend_submit", { session: "session-one", task: "Keep discussing account one", model: "fx:gateway:anthropic/claude" });
+  assert.equal(followup.run.id, one.run.id);
+  assert.notEqual(followup.run.conversationId, two.run.conversationId);
+  assert.equal(followup.after, worker.store.events(one.run.id, 0).filter((event) => event.seq <= followup.after).at(-1).seq);
+  assert.equal(worker.store.run(two.run.id).task, "Read account two");
+  await assert.rejects(worker.dispatch("frontend_submit", { session: "../escape", task: "Read" }), /Invalid frontend session/);
 });

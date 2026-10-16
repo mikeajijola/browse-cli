@@ -1,0 +1,8 @@
+This frontend incorporates vercel-labs/fx, Copyright Vercel, Inc.,
+licensed under the Apache License, Version 2.0.
+Upstream revision: f1ab492975df66b360acc7773ba2479a4a397272.
+
+Browse modifications: private execution bridge, isolated profile and Keychain
+service names, Browse branding, and provider token onboarding. The terminal
+editor, picker mechanics, and rendering are supplied by upstream.
+The provider credential helpers in src/vendor/fx are from the same revision.

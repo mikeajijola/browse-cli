@@ -204,3 +204,36 @@ test("provider authentication failures cannot become successful task answers", a
     globalThis.fetch = original;
   }
 });
+
+test("agent contract tools retain evidence and block mutations after completion", async (t) => {
+  const f = fixture(t), run = f.store.createRun("Read account and save a report");
+  let clicks = 0;
+  const neo = { tools: [
+    { name: "read", description: "Read", inputSchema: { type: "object", properties: {} } },
+    { name: "act", description: "Act", inputSchema: schema },
+  ], async ready() {}, async call(name) {
+    if (name === "act") clicks++;
+    return { content: [{ type: "text", text: "Account statement confirmed" }] };
+  } };
+  await executeAgent({ ...f, run, neo, createAgent: fakeAgent(async ({ tools }) => {
+    const invoke = (name, input) => tools.find((tool) => tool.name === name).execute(input);
+    const { sources } = await invoke("contract_read", {});
+    await invoke("contract_revise", { expectedVersion: 0, sourceId: sources[0].id,
+      objective: "Read account", reason: "User task", criteria: [{ id: "read", description: "Account statement observed" }] });
+    await invoke("read", {});
+    await invoke("contract_record", { expectedVersion: 1, criterionId: "read", summary: "Statement observed",
+      observationIds: [f.store.actions(run.id).at(-1).id], artifactPaths: [] });
+    await assert.rejects(invoke("act", { kind: "click" }), /Completion criteria reached/);
+    await invoke("read", {});
+  }) });
+  assert.equal(clicks, 0);
+  assert.equal(f.store.run(run.id).contract.criteria[0].status, "completed");
+});
+
+test("structured question options are yielded to the worker", async (t) => {
+  const f = fixture(t), run = f.store.createRun("Choose account");
+  const result = await executeAgent({ ...f, run, neo: { tools: [], async ready() {} },
+    createAgent: fakeAgent(async ({ tools }) => tools.find((tool) => tool.name === "require_input")
+      .execute({ question: "Which account?", options: ["Personal", "Work"] })) });
+  assert.deepEqual(result.control, { type: "input", question: "Which account?", options: ["Personal", "Work"] });
+});

@@ -6,6 +6,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { atomic, json } from "./util.mjs";
 import { googleToolSchema } from "./google-tool-schema.mjs";
+import { frontendAuth, frontendProviderOptions } from "./fx-provider.mjs";
 import { chatGPTAuth } from "./chatgpt.mjs";
 
 const providers = {
@@ -69,6 +70,7 @@ export async function providerModels(provider, apiKey, network = globalThis.fetc
 }
 
 export async function auth(p, model) {
+  if (model?.startsWith("fx:")) return frontendAuth(p, model);
   const saved = json(p.auth, {});
   model ||= saved.model;
   if (!model || !/^([a-z]+)\/[\w.-]+$/.test(model))
@@ -189,12 +191,13 @@ export async function setup(p, options = {}) {
   return { configured: true, model };
 }
 export function providerOptions(options) {
+  if (options.frontend) return frontendProviderOptions(options);
   const { provider, apiKey } = options,
-    modelId = options.model.split("/")[1],
+    modelId = options.model.slice(options.model.indexOf("/") + 1),
     spec = providers[provider];
   const network = options.fetch || globalThis.fetch;
   const guardedFetch = (url, init) => {
-    if (new URL(String(url)).origin !== spec.origin)
+    if (new URL(String(url)).origin !== (options.baseURL ? new URL(options.baseURL).origin : spec.origin))
       throw Error("Provider destination denied");
     return network(url, { ...init, redirect: "error" });
   };
@@ -202,7 +205,9 @@ export function providerOptions(options) {
     provider === "google"
       ? createGoogleGenerativeAI({ apiKey, fetch: guardedFetch })(modelId)
       : provider === "openai"
-        ? createOpenAI({ apiKey, fetch: guardedFetch }).responses(modelId)
+        ? (options.chatCompletions
+          ? createOpenAI({ apiKey, baseURL: options.baseURL, fetch: guardedFetch }).chat(modelId)
+          : createOpenAI({ apiKey, fetch: guardedFetch }).responses(modelId))
         : createAnthropic({ apiKey, fetch: guardedFetch })(modelId);
   return {
     apiKey: "direct-provider-transport",
@@ -254,8 +259,12 @@ export function providerOptions(options) {
           stream.pipeThrough(
             new TransformStream({
               transform(part, controller) {
-                if (part.type === "error")
-                  throw Error("Provider stream failed");
+                if (part.type === "error") {
+                  const error = Error("Provider stream interrupted");
+                  error.transient = true;
+                  options.onError?.(error);
+                  throw error;
+                }
                 if (options.chatgpt && part.type === "finish" &&
                     !["stop", "tool-calls"].includes(part.finishReason?.unified)) {
                   const error = Error("ChatGPT inference did not complete; try again or run browse login.");
@@ -272,15 +281,13 @@ export function providerOptions(options) {
         );
       } catch (e) {
         if (init.signal?.aborted) throw init.signal.reason;
-        options.onError?.(
-          new Error(
-            `Provider request failed (${e.statusCode || 400}): ${String(
-              e.message || "unknown error",
-            )
-              .replaceAll(apiKey, "[redacted]")
-              .slice(0, 500)}`,
-          ),
+        const error = new Error(
+          `Provider request failed (${e.statusCode || 400}): ${String(e.message || "unknown error")
+            .replaceAll(apiKey, "[redacted]").slice(0, 500)}`,
         );
+        error.transient = [429, 500, 502, 503, 504].includes(e.statusCode) ||
+          /timeout|timed out|network|fetch failed/i.test(e.message || "");
+        options.onError?.(error);
         return new Response(
           `Provider request failed (${e.statusCode || 400}); check credentials and model.`,
           {

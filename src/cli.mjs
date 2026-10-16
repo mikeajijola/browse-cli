@@ -8,7 +8,9 @@ import { loginChatGPT, chatGPTModels, chatGPTAccounts } from "./chatgpt.mjs";
 import { ensureWorker, request, serve } from "./worker.mjs";
 import { Store } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
-import { createChatInput } from "./terminal.mjs";
+import { createChatInput, safeText } from "./terminal.mjs";
+import { ChatPresentation } from "./presentation.mjs";
+import { contractProgress } from "./contract.mjs";
 
 const HELP = `browse — durable browser execution with libfx, Neo, and Fossil
 
@@ -44,14 +46,17 @@ Credentials and live execution state never enter the portable Fossil repository.
 `;
 
 export async function monitor(p, runId, options = {}, signal) {
+  const rpc = options.request || request;
   let cursor = options.after || 0,
     seenQuestion;
   while (!signal?.aborted) {
-    const events = await request(p, "events", { id: runId, after: cursor });
+    const events = await rpc(p, "events", { id: runId, after: cursor });
     for (const event of events) {
       cursor = event.seq;
+      options.onCursor?.(cursor);
       if (options.json) console.log(JSON.stringify({ runId, ...event }));
-      else if (event.type === "text_delta") process.stdout.write(event.delta);
+      else if (options.presenter) options.presenter.event(event);
+      else if (event.type === "text_delta") process.stdout.write(safeText(event.delta));
       else if (
         !options.quiet &&
         ["tool_start", "waiting", "recovery", "tool_error"].includes(event.type)
@@ -62,13 +67,17 @@ export async function monitor(p, runId, options = {}, signal) {
       else if (options.verbose && !options.quiet)
         process.stderr.write(`\n[${event.type}]\n`);
     }
-    const run = await request(p, "run", { id: runId });
+    const run = await rpc(p, "run", { id: runId });
     if (events.length === 1000) continue;
     if (
       TERMINAL.has(run.state) ||
       run.state === "paused" ||
       (run.state === "waiting" && run.question)
     ) {
+      if (options.presenter) {
+        if (!options.shouldFinish || options.shouldFinish()) options.presenter.finish(run);
+        return run;
+      }
       if (!options.json) process.stdout.write("\n");
       if (run.question && seenQuestion !== run.question) {
         if (!options.json)
@@ -110,10 +119,13 @@ async function attach(p, run, options) {
     request(p, "cancel", { id: run.id }).catch(() => {});
   };
   process.once("SIGINT", cancel);
+  const presenter = !options.json && process.stdout.isTTY ? new ChatPresentation({ ...options }) : undefined;
+  presenter?.start(run);
   try {
-    const result = await monitor(p, run.id, options);
+    const result = await monitor(p, run.id, { ...options, presenter });
     if (result?.state === "failed") process.exitCode = 1;
   } finally {
+    presenter?.close();
     process.off("SIGINT", cancel);
   }
 }
@@ -213,124 +225,172 @@ export function conversationPreview(opened, model) {
   return lines.join("\n") + "\n";
 }
 
-async function chat(p, options, initial) {
-  await ensureAuth(p, options);
-  await ensureWorker(p);
-  const opened = await request(p, "conversation_open");
-  if (!initial) initial = opened.run;
-  if (!options.json && !options.quiet)
-    process.stdout.write(conversationPreview(opened, options.model));
-  const rl = createChatInput({ history: opened.inputHistory || [] });
-  let current = initial,
-    active = false,
-    closed = false,
-    attachmentController,
-    submission;
-  async function execute(task) {
-    if (submission) await submission;
-    if (active) {
-      await request(p, "steer", { id: current.id, text: task });
-      return;
-    }
-    active = true;
-    submission = (async () => {
-      const after = current ? await request(p, "event_cursor", { id: current.id }) : 0;
-      current = await request(p, "conversation_submit", {
-        task,
-        model: options.model,
-        attachments: options.attach,
-      });
-      return after;
-    })();
-    try {
-      const after = await submission;
-      submission = null;
-      if (closed) return;
-      attachmentController = new AbortController();
-      current =
-        (await monitor(p, current.id, { ...options, after, interactive: true }, attachmentController.signal)) ||
-        current;
-    } finally {
-      submission = null;
-      active = false;
-      if (!closed) rl.prompt();
-    }
-  }
-  const handle = async (line) => {
-    line = line.trim();
-    if (!line) return;
-    if (line === "/exit") {
-      rl.close();
-      return;
-    }
-    if (line === "/help") {
-      console.log(
-        "/help /status /stop /new /reconnect /exit\nType during execution to steer; answer pending questions with a message.",
-      );
-      return;
-    }
-    if (line === "/status") {
-      print(await request(p, "status"), options);
-      return;
-    }
-    if (line === "/stop") {
-      if (current) await request(p, "cancel", { id: current.id });
-      return;
-    }
-    if (line === "/new") {
-      if (active) throw Error("Stop the current turn first");
-      await request(p, "conversation_new");
-      current = null;
-      rl.history = [];
-      if (!options.json) console.log("Started a new conversation. Your previous history is retained.");
-      return;
-    }
-    if (line === "/reconnect") {
-      console.log("Start BrowserOS Neo, then resume the failed or paused run.");
-      if (current && !active)
-        current = await request(p, "resume", { id: current.id, model: options.model });
-      if (current && !active) {
-        active = true;
-        try {
-          await monitor(p, current.id, { ...options, interactive: true });
-        } finally {
-          active = false;
-        }
-      }
-      return;
-    }
-    await execute(line);
+export async function chat(p, options, initial, {
+  input = process.stdin, output = process.stdout,
+  call = (method, args) => request(p, method, args),
+  authenticate = () => ensureAuth(p, options), connect = () => ensureWorker(p),
+} = {}) {
+  await authenticate();
+  await connect();
+  let opened = await call("conversation_open");
+  const rl = createChatInput({ input, output, history: opened.inputHistory || [], terminal: !options.json });
+  const presenter = options.json ? undefined : new ChatPresentation({ composer: rl, output, ...options });
+  const say = (text) => presenter ? presenter.notice(text) : output.write(JSON.stringify({ type: "notice", text }) + "\n");
+  const prompt = () => { if (!closed && !options.json) rl.prompt(); };
+  let current = initial || opened.run, active = false, closed = false, controller, monitoring,
+    submission = Promise.resolve(), historyBefore, conversations = [], staged = [...(options.attach || [])],
+    requiredCursor = opened.after || 0;
+  const monitorOptions = { ...options, presenter, interactive: true,
+    request: (_p, method, args) => call(method, args) };
+  const attachmentsChanged = () => {
+    if (presenter) { presenter.attachmentCount = staged.length; presenter.status(); }
   };
-  rl.on("line", (line) => {
-    handle(line)
-      .catch((e) => console.error(e.message))
+  const restore = (snapshot) => {
+    opened = snapshot; current = snapshot.run; historyBefore = undefined;
+    requiredCursor = snapshot.after || 0;
+    rl.history = snapshot.inputHistory || []; rl.historyIndex = -1;
+    if (presenter) {
+      presenter.state = current?.question ? "Needs your answer" : current?.state || "Ready";
+      presenter.progress = contractProgress(current?.contract);
+    }
+    if (!options.quiet && !options.json) say(conversationPreview(snapshot, options.model).trimEnd());
+    rl.setChoices(current?.questionOptions || []);
+    if (current?.question) {
+      presenter?.finish(current);
+    }
+    attachmentsChanged();
+  };
+  const watch = (after) => {
+    if (closed) return;
+    active = true; controller = new AbortController();
+    let cursor = after || 0, failed = false;
+    presenter?.start(current);
+    monitoring = monitor(p, current.id, { ...monitorOptions, after, onCursor: (value) => { cursor = value; },
+      shouldFinish: () => cursor >= requiredCursor }, controller.signal)
+      .then((run) => { if (run && cursor >= requiredCursor) { current = run; rl.setChoices(run.questionOptions || []); } })
+      .catch((error) => { failed = true; if (!closed) say(error.message); })
       .finally(() => {
-        if (!active && !closed) rl.prompt();
+        active = false;
+        if (!closed && !failed && cursor < requiredCursor) watch(cursor);
+        else { presenter?.close(); prompt(); }
       });
-  });
+  };
+  const execute = (task) => {
+    const attachments = staged; staged = []; attachmentsChanged();
+    const operation = submission.then(async () => {
+      const after = current ? await call("event_cursor", { id: current.id }) : 0;
+      const numeric = /^\d+$/.test(task) ? Number(task) - 1 : -1;
+      if (current?.questionOptions?.[numeric]) task = current.questionOptions[numeric];
+      const run = await call("conversation_submit", { task, model: options.model, attachments });
+      requiredCursor = await call("event_cursor", { id: run.id });
+      current = run; rl.setChoices([]);
+      if (run.conversationId) opened.conversation = { id: run.conversationId };
+      if (!active) watch(after);
+    });
+    submission = operation.catch(() => {});
+    return operation.catch((error) => { staged = [...new Set([...attachments, ...staged])]; attachmentsChanged(); throw error; });
+  };
+  const showMessages = (messages) => {
+    if (!messages.length) { say("No matching messages."); return; }
+    for (const message of messages) {
+      if (message.role === "assistant" && presenter) { presenter.text(message.content); presenter.flush(); }
+      else say(`${message.role === "user" ? "You" : message.role}: ${message.content}`);
+    }
+  };
+  const handle = async (text) => {
+    const line = text.trim();
+    if (!line) return;
+    if (!line.startsWith("/")) return execute(line);
+    const [, command, argument = ""] = /^\/(\S+)\s*([\s\S]*)$/.exec(line) || [];
+    if (command === "exit") { rl.close(); return; }
+    if (command === "help") {
+      say("/status · execution and objective progress\n/contract · completion criteria and evidence\n/stop · cancel current work\n/new · start a separate conversation\n/conversations · list saved conversations\n/switch NUMBER_OR_ID · reopen one\n/history [more] · page through messages\n/search TEXT · find older messages\n/attach PATH · add a file to your next message\n/attachments · list attached files\n/detach NUMBER|all · remove attachments\n/details · inspect recorded browser results\n/reconnect · resume interrupted work\n/exit · detach and exit\n\nEnter sends; Alt+Enter, Ctrl+J or backslash+Enter inserts a newline.\nUp/Down recalls messages at the edges of the draft. Tab completes commands.\nType while working to steer. Questions accept typed answers or numbered choices.");
+    } else if (command === "status") {
+      const status = await call("status");
+      const run = current ? await call("run", { id: current.id }) : null;
+      say(`Conversation: ${opened.conversation?.id || "new"}\nModel: ${options.model}\nState: ${run?.state || "ready"}${run?.question ? ` · ${run.question}` : ""}${status.progress ? `\nObjective v${status.progress.version}: ${status.progress.completed}/${status.progress.total} criteria complete` : ""}${run?.wakeAt ? `\nResumes: ${new Date(run.wakeAt).toISOString()}` : ""}${status.publicationError ? `\nHistory publication pending: ${status.publicationError}` : ""}`);
+    } else if (command === "contract") {
+      if (!current) { say("No objective recorded yet."); return; }
+      const { contract, progress } = await call("contract", { id: current.id });
+      if (!contract) { say("No multi-step objective recorded for this task."); return; }
+      say(`Objective v${contract.version}: ${contract.objective}\n${progress.completed}/${progress.total} criteria complete\n` +
+        contract.criteria.map((item) => `${item.status === "completed" ? "✓" : "○"} ${item.description}${item.evidence ? `\n  ${item.evidence.summary}\n  Evidence: ${[...item.evidence.observationIds, ...item.evidence.artifactPaths].join(", ")}` : ""}`).join("\n"));
+    } else if (command === "stop") {
+      await submission;
+      if (current) { current = await call("cancel", { id: current.id }); say("Cancellation requested. Completed browser actions remain recorded."); }
+    } else if (command === "new" || command === "switch") {
+      await submission;
+      if (active) throw Error("Stop the current turn before changing conversations, or /exit to detach.");
+      if (command === "new") {
+        await call("conversation_new"); staged = []; restore(await call("conversation_open"));
+        say("Started a new conversation. Previous conversations remain available with /conversations.");
+      } else {
+        if (!argument) throw Error("Use /conversations, then /switch NUMBER_OR_ID.");
+        if (!conversations.length) conversations = await call("conversations");
+        const matches = /^\d+$/.test(argument) ? [conversations[Number(argument) - 1]].filter(Boolean)
+          : conversations.filter((item) => item.id.startsWith(argument));
+        if (matches.length !== 1) throw Error("Choose a unique conversation number or ID from /conversations.");
+        staged = []; restore(await call("conversation_select", { id: matches[0].id }));
+        if (current && !current.historical && ["running", "queued", "waiting"].includes(current.state) && !current.question) watch(opened.after);
+      }
+    } else if (command === "conversations") {
+      conversations = await call("conversations");
+      say(conversations.map((item, index) => `${index + 1}. ${item.id === opened.conversation?.id ? "› " : ""}${item.title} · ${item.message_count} messages\n   ${item.id}`).join("\n") || "No saved conversations yet.");
+    } else if (command === "history") {
+      if (argument && argument !== "more") throw Error("Use /history or /history more.");
+      if (argument === "more" && historyBefore === null) { say("Beginning of conversation."); return; }
+      const page = await call("conversation_history", { before: argument === "more" ? historyBefore : undefined });
+      historyBefore = page.before; showMessages(page.messages);
+      say(page.before ? "Use /history more for older messages." : "Beginning of conversation.");
+    } else if (command === "search") {
+      if (!argument) throw Error("Use /search TEXT.");
+      showMessages(await call("conversation_search", { query: argument }));
+    } else if (command === "attach") {
+      if (!argument) throw Error("Use /attach PATH.");
+      const file = fs.realpathSync(argument.replace(/^(["'])(.*)\1$/, "$2"));
+      if (!fs.statSync(file).isFile()) throw Error("Attachment must be a file.");
+      staged = [...new Set([...staged, file])]; attachmentsChanged(); say(`Attached ${path.basename(file)} to your next message.`);
+    } else if (command === "attachments") {
+      say(staged.map((file, index) => `${index + 1}. ${file}`).join("\n") || "No files attached to the next message.");
+    } else if (command === "detach") {
+      if (argument === "all") staged = [];
+      else if (/^\d+$/.test(argument) && staged[Number(argument) - 1]) staged.splice(Number(argument) - 1, 1);
+      else throw Error("Use /detach NUMBER or /detach all.");
+      attachmentsChanged(); say(`${staged.length} files attached to your next message.`);
+    } else if (command === "details") {
+      if (!current) { say("No browser actions yet."); return; }
+      const run = await call("run", { id: current.id });
+      presenter ? presenter.details(run.actions) : say(JSON.stringify(run.actions));
+    } else if (command === "reconnect") {
+      if (active) { say("Already attached to active work."); return; }
+      if (!current) { say("Start BrowserOS Neo, then send a task."); return; }
+      const run = await call("run", { id: current.id });
+      if (run.question) { current = run; rl.setChoices(run.questionOptions || []); say(run.question); return; }
+      const after = await call("event_cursor", { id: current.id });
+      current = await call("resume", { id: current.id, model: options.model }); watch(after);
+    } else throw Error(`Unknown command: /${command || ""}. Use /help or Tab to see commands.`);
+  };
+  const finished = new Promise((resolve) => rl.once("close", () => {
+    closed = true; controller?.abort(); presenter?.close(); resolve();
+  }));
+  rl.on("beforeSubmit", () => presenter?.flush());
+  rl.on("notice", say);
+  rl.on("line", (line) => { handle(line).catch((error) => { if (!closed) say(error.message); }).finally(prompt); });
   rl.on("SIGINT", () => {
-    if (active && current)
-      request(p, "cancel", { id: current.id }).catch((e) =>
-        console.error(e.message),
-      );
+    if (active) handle("/stop").catch((error) => say(error.message));
+    else if (rl.line) rl.replace("");
     else rl.close();
   });
-  if (current && ["running", "queued"].includes(current.state) && !current.historical) {
-    active = true;
-    attachmentController = new AbortController();
-    monitor(p, current.id, { ...options, after: opened.after, interactive: true }, attachmentController.signal)
-      .then((run) => { if (run) current = run; })
-      .catch((e) => console.error(e.message))
-      .finally(() => { active = false; if (!closed) rl.prompt(); });
-  }
-  rl.prompt();
-  await new Promise((resolve) =>
-    rl.once("close", () => {
-      closed = true;
-      attachmentController?.abort();
-      resolve();
-    }),
-  );
+  let lastEscape = 0;
+  rl.on("escape", () => {
+    if (Date.now() - lastEscape < 700 && active) handle("/stop").catch((error) => say(error.message));
+    lastEscape = Date.now();
+  });
+  restore(opened);
+  if (current && !current.historical && ["running", "queued", "waiting"].includes(current.state) && !current.question) watch(opened.after);
+  prompt();
+  try { await finished; await submission; await monitoring; }
+  finally { presenter?.close(); rl.close(); }
 }
 
 async function importWorkspace(p, source) {
